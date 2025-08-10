@@ -46,9 +46,9 @@ class ModelConfig:
     num_symbols: int
     hour_size: int
     dow_size: int
+    num_horizons: int
     num_bases: int | None = None
     num_quotes: int | None = None
-    num_horizons: int
     d_model: int = 384
     n_layers: int = 6
     dropout: float = 0.1
