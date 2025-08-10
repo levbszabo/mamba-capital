@@ -46,6 +46,8 @@ class ModelConfig:
     num_symbols: int
     hour_size: int
     dow_size: int
+    num_bases: int | None = None
+    num_quotes: int | None = None
     num_horizons: int
     d_model: int = 384
     n_layers: int = 6
@@ -57,6 +59,8 @@ class ModelConfig:
     symbol_emb_dim: int = 32
     hour_emb_dim: int = 16
     dow_emb_dim: int = 8
+    base_emb_dim: int = 8
+    quote_emb_dim: int = 8
     # Backbone selection
     backbone: Literal["auto", "mamba", "transformer"] = "auto"
     # Mamba-specific hyperparameters (used if available)
@@ -151,8 +155,22 @@ class ForecastingModel(nn.Module):
         self.symbol_emb = nn.Embedding(cfg.num_symbols, cfg.symbol_emb_dim)
         self.hour_emb = nn.Embedding(cfg.hour_size, cfg.hour_emb_dim)
         self.dow_emb = nn.Embedding(cfg.dow_size, cfg.dow_emb_dim)
+        self.base_emb = (
+            nn.Embedding(cfg.num_bases, cfg.base_emb_dim)
+            if cfg.num_bases is not None and cfg.num_bases > 0
+            else None
+        )
+        self.quote_emb = (
+            nn.Embedding(cfg.num_quotes, cfg.quote_emb_dim)
+            if cfg.num_quotes is not None and cfg.num_quotes > 0
+            else None
+        )
 
         cat_total = cfg.symbol_emb_dim + cfg.hour_emb_dim + cfg.dow_emb_dim
+        if self.base_emb is not None:
+            cat_total += cfg.base_emb_dim
+        if self.quote_emb is not None:
+            cat_total += cfg.quote_emb_dim
         self.cat_proj = nn.Sequential(
             nn.Linear(cat_total, cfg.d_model),
             nn.LayerNorm(cfg.d_model),
@@ -207,6 +225,8 @@ class ForecastingModel(nn.Module):
         x_symbol_id: torch.Tensor,
         x_ny_hour_id: torch.Tensor,
         x_ny_dow_id: torch.Tensor,
+        x_base_id: torch.Tensor | None = None,
+        x_quote_id: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Shapes
         # x_cont: [B, L, C]
@@ -218,7 +238,12 @@ class ForecastingModel(nn.Module):
         sym_e = self.symbol_emb(x_symbol_id)
         hour_e = self.hour_emb(x_ny_hour_id)
         dow_e = self.dow_emb(x_ny_dow_id)
-        cat = torch.cat([sym_e, hour_e, dow_e], dim=-1)
+        embeds = [sym_e, hour_e, dow_e]
+        if self.base_emb is not None and x_base_id is not None:
+            embeds.append(self.base_emb(x_base_id))
+        if self.quote_emb is not None and x_quote_id is not None:
+            embeds.append(self.quote_emb(x_quote_id))
+        cat = torch.cat(embeds, dim=-1)
         cat = self.cat_proj(cat)
 
         x = cont + cat
@@ -250,6 +275,8 @@ class ForecastingModel(nn.Module):
         x_symbol_id: torch.Tensor,
         x_ny_hour_id: torch.Tensor,
         x_ny_dow_id: torch.Tensor,
+        x_base_id: torch.Tensor | None = None,
+        x_quote_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Returns a low-dimensional latent representation for downstream tasks.
 
@@ -259,7 +286,12 @@ class ForecastingModel(nn.Module):
         sym_e = self.symbol_emb(x_symbol_id)
         hour_e = self.hour_emb(x_ny_hour_id)
         dow_e = self.dow_emb(x_ny_dow_id)
-        cat = torch.cat([sym_e, hour_e, dow_e], dim=-1)
+        embeds = [sym_e, hour_e, dow_e]
+        if self.base_emb is not None and x_base_id is not None:
+            embeds.append(self.base_emb(x_base_id))
+        if self.quote_emb is not None and x_quote_id is not None:
+            embeds.append(self.quote_emb(x_quote_id))
+        cat = torch.cat(embeds, dim=-1)
         cat = self.cat_proj(cat)
         x = cont + cat
         x = self.backbone(x)

@@ -153,6 +153,17 @@ def load_cleaned_forex(
     data = data.sort_values(["symbol", "ts_utc"], kind="mergesort").reset_index(
         drop=True
     )
+    # Derive base/quote currency codes when symbol looks like 'EURUSD'
+    try:
+        data["symbol"] = data["symbol"].astype(str).str.upper()
+        mask_len6 = data["symbol"].str.len() == 6
+        data.loc[mask_len6, "base_ccy"] = data.loc[mask_len6, "symbol"].str.slice(0, 3)
+        data.loc[mask_len6, "quote_ccy"] = data.loc[mask_len6, "symbol"].str.slice(3, 6)
+        data["base_ccy"] = data["base_ccy"].fillna("UNK")
+        data["quote_ccy"] = data["quote_ccy"].fillna("UNK")
+    except Exception:
+        data["base_ccy"] = "UNK"
+        data["quote_ccy"] = "UNK"
     return data
 
 
@@ -175,7 +186,9 @@ def compute_forward_returns_per_symbol(
     return data
 
 
-def add_derived_features(data: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+def add_derived_features(
+    data: pd.DataFrame, add_xsec_features: bool = True
+) -> Tuple[pd.DataFrame, List[str]]:
     data = data.copy()
 
     # Continuous base features
@@ -220,6 +233,24 @@ def add_derived_features(data: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         vals[~np.isfinite(vals)] = np.nan
         data[col] = vals
 
+    # Cross-sectional features per timestamp (optional)
+    if add_xsec_features and "ret_log_1h" in data.columns:
+        grouped = data.groupby("ts_utc")
+        data["xsec_mean_ret_1h"] = grouped["ret_log_1h"].transform(
+            lambda s: np.nanmean(pd.to_numeric(s, errors="coerce"))
+        )
+        data["xsec_std_ret_1h"] = grouped["ret_log_1h"].transform(
+            lambda s: np.nanstd(pd.to_numeric(s, errors="coerce"))
+        )
+        data["xsec_pct_up_1h"] = grouped["ret_log_1h"].transform(
+            lambda s: np.nanmean(pd.to_numeric(s, errors="coerce") > 0)
+        )
+        continuous_features += [
+            "xsec_mean_ret_1h",
+            "xsec_std_ret_1h",
+            "xsec_pct_up_1h",
+        ]
+
     return data, continuous_features
 
 
@@ -227,6 +258,20 @@ def build_vocabularies(data: pd.DataFrame) -> Dict[str, Dict]:
     symbols = sorted(data["symbol"].astype(str).unique().tolist())
     symbol_to_id = {s: i for i, s in enumerate(symbols)}
     id_to_symbol = {i: s for s, i in symbol_to_id.items()}
+    bases = sorted(
+        data.get("base_ccy", pd.Series(["UNK"]).repeat(len(data)))
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    quotes = sorted(
+        data.get("quote_ccy", pd.Series(["UNK"]).repeat(len(data)))
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    base_to_id = {b: i for i, b in enumerate(bases)}
+    quote_to_id = {q: i for i, q in enumerate(quotes)}
 
     # ny_hour and ny_dow are already numeric in 0..23 and 0..6
     vocab = {
@@ -235,6 +280,10 @@ def build_vocabularies(data: pd.DataFrame) -> Dict[str, Dict]:
         "num_symbols": len(symbols),
         "hour_size": 24,
         "dow_size": 7,
+        "base_to_id": base_to_id,
+        "quote_to_id": quote_to_id,
+        "num_bases": len(bases),
+        "num_quotes": len(quotes),
     }
     return vocab
 
@@ -369,14 +418,23 @@ def apply_target_scalers(
 def _windowize_symbol(
     df_sym: pd.DataFrame,
     symbol_id: int,
+    base_id: Optional[int],
+    quote_id: Optional[int],
     continuous_features: List[str],
     horizons: Tuple[int, int, int],
     sequence_length: int,
     stride: int,
 ) -> Tuple[
-    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[pd.Timestamp]
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    np.ndarray,
+    List[pd.Timestamp],
 ]:
-    # Returns: x_cont [N,L,C], x_sym_id [N,L], x_hour_id [N,L], x_dow_id [N,L], y [N,3], end_timestamps [N]
+    # Returns: x_cont [N,L,C], x_sym_id [N,L], x_hour_id [N,L], x_dow_id [N,L], x_base_id [N,L] or None, x_quote_id [N,L] or None, y [N,H], end_timestamps [N]
     df = df_sym.reset_index(drop=True)
     num_rows = df.shape[0]
 
@@ -395,6 +453,8 @@ def _windowize_symbol(
     x_sym_id_list: List[np.ndarray] = []
     x_hour_id_list: List[np.ndarray] = []
     x_dow_id_list: List[np.ndarray] = []
+    x_base_id_list: List[np.ndarray] = []
+    x_quote_id_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
     ts_end_list: List[pd.Timestamp] = []
 
@@ -429,8 +489,18 @@ def _windowize_symbol(
         x_cont = feature_matrix[window_slice, :]
         x_hour = ny_hour[window_slice]
         x_dow = ny_dow[window_slice]
-        # Symbol id is constant along the window
+        # Symbol/base/quote ids are constant along the window
         x_sym = np.full((sequence_length,), symbol_id, dtype=np.int64)
+        x_base = (
+            np.full((sequence_length,), base_id, dtype=np.int64)
+            if base_id is not None
+            else None
+        )
+        x_quote = (
+            np.full((sequence_length,), quote_id, dtype=np.int64)
+            if quote_id is not None
+            else None
+        )
 
         y = targets[i, :]
         timestamp_end = pd.Timestamp(ts[i])
@@ -439,6 +509,10 @@ def _windowize_symbol(
         x_sym_id_list.append(x_sym)
         x_hour_id_list.append(x_hour)
         x_dow_id_list.append(x_dow)
+        if x_base is not None:
+            x_base_id_list.append(x_base)
+        if x_quote is not None:
+            x_quote_id_list.append(x_quote)
         y_list.append(y)
         ts_end_list.append(timestamp_end)
 
@@ -456,9 +530,15 @@ def _windowize_symbol(
     X_sym = np.stack(x_sym_id_list, axis=0).astype(np.int64)
     X_hour = np.stack(x_hour_id_list, axis=0).astype(np.int64)
     X_dow = np.stack(x_dow_id_list, axis=0).astype(np.int64)
+    X_base = (
+        np.stack(x_base_id_list, axis=0).astype(np.int64) if x_base_id_list else None
+    )
+    X_quote = (
+        np.stack(x_quote_id_list, axis=0).astype(np.int64) if x_quote_id_list else None
+    )
     Y = np.stack(y_list, axis=0).astype(np.float32)
 
-    return X_cont, X_sym, X_hour, X_dow, Y, ts_end_list
+    return X_cont, X_sym, X_hour, X_dow, X_base, X_quote, Y, ts_end_list
 
 
 def build_windows(
@@ -476,6 +556,8 @@ def build_windows(
     metas: Dict[str, List[Dict[str, object]]] = {}
 
     symbol_to_id: Dict[str, int] = vocab["symbol_to_id"]  # type: ignore
+    base_to_id: Dict[str, int] = vocab.get("base_to_id", {})  # type: ignore
+    quote_to_id: Dict[str, int] = vocab.get("quote_to_id", {})  # type: ignore
     target_cols = [f"fwd_ret_log_{h}h" for h in horizons]
 
     for split_name in ["train", "val", "test"]:
@@ -483,6 +565,8 @@ def build_windows(
         X_sym_all: List[np.ndarray] = []
         X_hour_all: List[np.ndarray] = []
         X_dow_all: List[np.ndarray] = []
+        X_base_all: List[np.ndarray] = []
+        X_quote_all: List[np.ndarray] = []
         Y_all: List[np.ndarray] = []
         meta_list: List[Dict[str, object]] = []
 
@@ -492,13 +576,27 @@ def build_windows(
         # Group by symbol to windowize independently
         for symbol, df_sym in df_split.groupby("symbol", sort=False):
             sym_id = symbol_to_id[symbol]
-            X_cont, X_sym, X_hour, X_dow, Y, ts_end = _windowize_symbol(
-                df_sym=df_sym,
-                symbol_id=sym_id,
-                continuous_features=continuous_features,
-                horizons=horizons,
-                sequence_length=sequence_length,
-                stride=stride,
+            base_id = (
+                base_to_id.get(str(df_sym.get("base_ccy", "UNK").iloc[0]), None)
+                if "base_ccy" in df_sym.columns
+                else None
+            )
+            quote_id = (
+                quote_to_id.get(str(df_sym.get("quote_ccy", "UNK").iloc[0]), None)
+                if "quote_ccy" in df_sym.columns
+                else None
+            )
+            X_cont, X_sym, X_hour, X_dow, X_base, X_quote, Y, ts_end = (
+                _windowize_symbol(
+                    df_sym=df_sym,
+                    symbol_id=sym_id,
+                    base_id=base_id,
+                    quote_id=quote_id,
+                    continuous_features=continuous_features,
+                    horizons=horizons,
+                    sequence_length=sequence_length,
+                    stride=stride,
+                )
             )
 
             if X_cont.shape[0] == 0:
@@ -508,6 +606,10 @@ def build_windows(
             X_sym_all.append(X_sym)
             X_hour_all.append(X_hour)
             X_dow_all.append(X_dow)
+            if X_base is not None:
+                X_base_all.append(X_base)
+            if X_quote is not None:
+                X_quote_all.append(X_quote)
             Y_all.append(Y)
             # Prepare metadata entries
             for t in ts_end:
@@ -533,15 +635,28 @@ def build_windows(
         X_sym = torch.from_numpy(np.concatenate(X_sym_all, axis=0))
         X_hour = torch.from_numpy(np.concatenate(X_hour_all, axis=0))
         X_dow = torch.from_numpy(np.concatenate(X_dow_all, axis=0))
+        X_base = (
+            torch.from_numpy(np.concatenate(X_base_all, axis=0)) if X_base_all else None
+        )
+        X_quote = (
+            torch.from_numpy(np.concatenate(X_quote_all, axis=0))
+            if X_quote_all
+            else None
+        )
         Y = torch.from_numpy(np.concatenate(Y_all, axis=0))
 
-        datasets[split_name] = {
+        tensors = {
             "x_cont": X_cont,
             "x_symbol_id": X_sym,
             "x_ny_hour_id": X_hour,
             "x_ny_dow_id": X_dow,
             "y": Y,
         }
+        if X_base is not None:
+            tensors["x_base_id"] = X_base
+        if X_quote is not None:
+            tensors["x_quote_id"] = X_quote
+        datasets[split_name] = tensors
         metas[split_name] = meta_list
 
     return datasets, metas
@@ -617,6 +732,7 @@ def parse_args() -> BuildConfig:
         symbols=args.symbols,
         standardize_targets=not bool(args.no_standardize_targets),
         splits=splits,
+        horizons=tuple([int(h) for h in getattr(args, "target_horizons", [1])]),
     )
     return cfg
 
@@ -631,7 +747,7 @@ def main(cfg: BuildConfig) -> None:
     data = compute_forward_returns_per_symbol(data, cfg.horizons)
 
     # 3) Add derived continuous features
-    data, continuous_features = add_derived_features(data)
+    data, continuous_features = add_derived_features(data, add_xsec_features=True)
 
     # 4) Build vocabularies (categoricals)
     vocab = build_vocabularies(data)

@@ -48,7 +48,12 @@ def make_dataloaders(
         x_hour = tensors["x_ny_hour_id"]
         x_dow = tensors["x_ny_dow_id"]
         y = tensors["y"]
-        ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
+        x_base = tensors.get("x_base_id")
+        x_quote = tensors.get("x_quote_id")
+        if x_base is not None and x_quote is not None:
+            ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y)
+        else:
+            ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
         shuffle = split == "train"
         drop_last = split == "train"
         loaders[split] = DataLoader(
@@ -81,7 +86,13 @@ def train_one_epoch(
     num_steps = len(loader)
     step = 0
     start_time = time.time()
-    for x_cont, x_sym, x_hour, x_dow, y in loader:
+    for batch in loader:
+        if len(batch) == 7:
+            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = batch
+        else:
+            x_cont, x_sym, x_hour, x_dow, y = batch
+            x_base = None
+            x_quote = None
         x_cont = x_cont.to(device, non_blocking=True)
         x_sym = x_sym.to(device, non_blocking=True)
         x_hour = x_hour.to(device, non_blocking=True)
@@ -94,7 +105,7 @@ def train_one_epoch(
             if autocast_dtype
             else contextlib.nullcontext()
         ):
-            mean, log_var = model(x_cont, x_sym, x_hour, x_dow)
+            mean, log_var = model(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
             loss = gaussian_nll(mean, log_var, y, horizon_weights)
 
         if scaler is not None:
@@ -147,7 +158,13 @@ def evaluate(
 
     num_steps = len(loader)
     step = 0
-    for x_cont, x_sym, x_hour, x_dow, y in loader:
+    for batch in loader:
+        if len(batch) == 7:
+            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = batch
+        else:
+            x_cont, x_sym, x_hour, x_dow, y = batch
+            x_base = None
+            x_quote = None
         x_cont = x_cont.to(device, non_blocking=True)
         x_sym = x_sym.to(device, non_blocking=True)
         x_hour = x_hour.to(device, non_blocking=True)
@@ -158,7 +175,7 @@ def evaluate(
             if autocast_dtype
             else contextlib.nullcontext()
         ):
-            mean, log_var = model(x_cont, x_sym, x_hour, x_dow)
+            mean, log_var = model(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
         loss = gaussian_nll(mean, log_var, y, horizon_weights)
         total_loss += loss.item() * y.size(0)
         total_count += y.size(0)
@@ -274,6 +291,8 @@ def main():
         num_symbols=int(vocab["num_symbols"]),
         hour_size=int(vocab["hour_size"]),
         dow_size=int(vocab["dow_size"]),
+        num_bases=int(vocab.get("num_bases", 0)) or None,
+        num_quotes=int(vocab.get("num_quotes", 0)) or None,
         num_horizons=len(horizons),
         d_model=args.d_model,
         n_layers=args.n_layers,
