@@ -560,14 +560,14 @@ def parse_args() -> BuildConfig:
         "--input_dir",
         type=str,
         required=False,
-        default="/Users/leventeszabo/mamba-capital/data/forex_cleaned",
+        default="data/forex_cleaned",
         help="Directory containing processed_*_hourly.csv files",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         required=False,
-        default="/Users/leventeszabo/mamba-capital/mamba-model/datasets/fx_mamba_v1",
+        default="mamba-model/datasets/fx_mamba_v1",
         help="Directory to write .pt datasets and metadata",
     )
     parser.add_argument("--sequence_length", type=int, default=512)

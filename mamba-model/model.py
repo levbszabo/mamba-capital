@@ -63,6 +63,10 @@ class ModelConfig:
     mamba_d_state: int = 64
     mamba_d_conv: int = 4
     mamba_expand: int = 2
+    # Sequence pooling
+    pooling: Literal["last", "mean", "attn"] = "last"
+    # Latent representation size for downstream tasks (e.g., RL)
+    latent_dim: int = 64
 
 
 class ResidualBlock(nn.Module):
@@ -185,6 +189,12 @@ class ForecastingModel(nn.Module):
         self.head_mean = nn.Linear(cfg.d_model, cfg.num_horizons)
         self.head_logvar = nn.Linear(cfg.d_model, cfg.num_horizons)
 
+        # Latent projection for representation learning / RL
+        self.latent_proj = nn.Sequential(
+            nn.LayerNorm(cfg.d_model),
+            nn.Linear(cfg.d_model, cfg.latent_dim),
+        )
+
         # Small init for stability
         nn.init.zeros_(self.head_mean.weight)
         nn.init.zeros_(self.head_mean.bias)
@@ -213,11 +223,61 @@ class ForecastingModel(nn.Module):
 
         x = cont + cat
         x = self.backbone(x)
-        h_last = x[:, -1, :]
+        if self.cfg.pooling == "mean":
+            h = x.mean(dim=1)
+        elif self.cfg.pooling == "attn":
+            # Lightweight attention pooling: parameterized query vector
+            if not hasattr(self, "attn_q"):
+                self.attn_q = nn.Parameter(torch.randn(self.cfg.d_model))
+            q = self.attn_q.view(1, 1, -1)
+            attn = torch.softmax(
+                torch.matmul(x, q.transpose(1, 2)).squeeze(-1)
+                / (self.cfg.d_model**0.5),
+                dim=1,
+            )
+            h = (x * attn.unsqueeze(-1)).sum(dim=1)
+        else:
+            h = x[:, -1, :]
 
-        mean = self.head_mean(h_last)
-        log_var = self.head_logvar(h_last)
+        mean = self.head_mean(h)
+        log_var = self.head_logvar(h)
         return mean, log_var
+
+    @torch.no_grad()
+    def encode(
+        self,
+        x_cont: torch.Tensor,
+        x_symbol_id: torch.Tensor,
+        x_ny_hour_id: torch.Tensor,
+        x_ny_dow_id: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns a low-dimensional latent representation for downstream tasks.
+
+        Shape: inputs as forward; output [batch, latent_dim]
+        """
+        cont = self.cont_proj(x_cont)
+        sym_e = self.symbol_emb(x_symbol_id)
+        hour_e = self.hour_emb(x_ny_hour_id)
+        dow_e = self.dow_emb(x_ny_dow_id)
+        cat = torch.cat([sym_e, hour_e, dow_e], dim=-1)
+        cat = self.cat_proj(cat)
+        x = cont + cat
+        x = self.backbone(x)
+        if self.cfg.pooling == "mean":
+            h = x.mean(dim=1)
+        elif self.cfg.pooling == "attn":
+            if not hasattr(self, "attn_q"):
+                self.attn_q = nn.Parameter(torch.randn(self.cfg.d_model))
+            q = self.attn_q.view(1, 1, -1)
+            attn = torch.softmax(
+                torch.matmul(x, q.transpose(1, 2)).squeeze(-1)
+                / (self.cfg.d_model**0.5),
+                dim=1,
+            )
+            h = (x * attn.unsqueeze(-1)).sum(dim=1)
+        else:
+            h = x[:, -1, :]
+        return self.latent_proj(h)
 
 
 def gaussian_nll(

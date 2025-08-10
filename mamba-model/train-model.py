@@ -20,6 +20,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import contextlib
 
 from model import ForecastingModel, ModelConfig, gaussian_nll, count_parameters
 
@@ -34,7 +35,11 @@ def load_tensors(dataset_dir: Path) -> Tuple[Dict[str, Dict[str, torch.Tensor]],
 
 
 def make_dataloaders(
-    data: Dict[str, Dict[str, torch.Tensor]], batch_size: int, num_workers: int = 0
+    data: Dict[str, Dict[str, torch.Tensor]],
+    batch_size: int,
+    num_workers: int = 0,
+    prefetch_factor: int = 4,
+    persistent_workers: bool = True,
 ) -> Dict[str, DataLoader]:
     loaders: Dict[str, DataLoader] = {}
     for split, tensors in data.items():
@@ -45,12 +50,16 @@ def make_dataloaders(
         y = tensors["y"]
         ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
         shuffle = split == "train"
+        drop_last = split == "train"
         loaders[split] = DataLoader(
             ds,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=persistent_workers if num_workers > 0 else False,
             pin_memory=True,
+            drop_last=drop_last,
         )
     return loaders
 
@@ -63,6 +72,8 @@ def train_one_epoch(
     horizon_weights: torch.Tensor,
     log_interval: int = 100,
     max_steps: int | None = None,
+    autocast_dtype: torch.dtype | None = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -71,18 +82,31 @@ def train_one_epoch(
     step = 0
     start_time = time.time()
     for x_cont, x_sym, x_hour, x_dow, y in loader:
-        x_cont = x_cont.to(device)
-        x_sym = x_sym.to(device)
-        x_hour = x_hour.to(device)
-        x_dow = x_dow.to(device)
-        y = y.to(device)
+        x_cont = x_cont.to(device, non_blocking=True)
+        x_sym = x_sym.to(device, non_blocking=True)
+        x_hour = x_hour.to(device, non_blocking=True)
+        x_dow = x_dow.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        mean, log_var = model(x_cont, x_sym, x_hour, x_dow)
-        loss = gaussian_nll(mean, log_var, y, horizon_weights)
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        with (
+            torch.autocast("cuda", dtype=autocast_dtype)
+            if autocast_dtype
+            else contextlib.nullcontext()
+        ):
+            mean, log_var = model(x_cont, x_sym, x_hour, x_dow)
+            loss = gaussian_nll(mean, log_var, y, horizon_weights)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         total_loss += loss.item() * y.size(0)
         total_count += y.size(0)
         step += 1
@@ -109,6 +133,7 @@ def evaluate(
     horizon_weights: torch.Tensor,
     log_interval: int = 0,
     max_steps: int | None = None,
+    autocast_dtype: torch.dtype | None = None,
 ) -> Tuple[float, Dict[str, float]]:
     model.eval()
     total_loss = 0.0
@@ -123,12 +148,17 @@ def evaluate(
     num_steps = len(loader)
     step = 0
     for x_cont, x_sym, x_hour, x_dow, y in loader:
-        x_cont = x_cont.to(device)
-        x_sym = x_sym.to(device)
-        x_hour = x_hour.to(device)
-        x_dow = x_dow.to(device)
-        y = y.to(device)
-        mean, log_var = model(x_cont, x_sym, x_hour, x_dow)
+        x_cont = x_cont.to(device, non_blocking=True)
+        x_sym = x_sym.to(device, non_blocking=True)
+        x_hour = x_hour.to(device, non_blocking=True)
+        x_dow = x_dow.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        with (
+            torch.autocast("cuda", dtype=autocast_dtype)
+            if autocast_dtype
+            else contextlib.nullcontext()
+        ):
+            mean, log_var = model(x_cont, x_sym, x_hour, x_dow)
         loss = gaussian_nll(mean, log_var, y, horizon_weights)
         total_loss += loss.item() * y.size(0)
         total_count += y.size(0)
@@ -181,9 +211,12 @@ def parse_args():
         "--dataset_dir",
         type=str,
         required=False,
-        default="/Users/leventeszabo/mamba-capital/mamba-model/datasets/fx_mamba_v1",
+        default="mamba-model/datasets/fx_mamba_v1",
     )
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--no_persistent_workers", action="store_true")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -202,7 +235,7 @@ def parse_args():
         "--save_dir",
         type=str,
         required=False,
-        default="/Users/leventeszabo/mamba-capital/mamba-model/checkpoints",
+        default="mamba-model/checkpoints",
     )
     parser.add_argument(
         "--horizon_weights", type=float, nargs="*", default=[1.0, 0.8, 0.6]
@@ -210,6 +243,16 @@ def parse_args():
     parser.add_argument("--log_interval", type=int, default=200)
     parser.add_argument("--max_train_steps", type=int, default=0)
     parser.add_argument("--max_eval_steps", type=int, default=0)
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "bf16", "fp16"],
+        default="bf16" if torch.cuda.is_available() else "fp32",
+        help="Compute precision; bf16 is recommended on A100",
+    )
+    parser.add_argument(
+        "--compile_model", action="store_true", help="Use torch.compile for speed"
+    )
     args = parser.parse_args()
     return args
 
@@ -243,7 +286,13 @@ def main():
     model = ForecastingModel(cfg).to(device)
     print(f"Model params: {count_parameters(model):,}")
 
-    loaders = make_dataloaders(data, batch_size=args.batch_size)
+    loaders = make_dataloaders(
+        data,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=not args.no_persistent_workers,
+    )
 
     # Print dataset sizes and basic setup
     n_train = int(loaders["train"].dataset.tensors[-1].shape[0])  # type: ignore
@@ -255,6 +304,16 @@ def main():
     )
     print(f"Device: {device} | Backbone: {cfg.backbone}")
 
+    # Enable high-throughput math on Ampere (A100)
+    if device.type == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            print("TF32 enabled for matmul and cuDNN")
+        except Exception:
+            pass
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -263,6 +322,23 @@ def main():
     horizon_weights = torch.tensor(
         args.horizon_weights, dtype=torch.float32, device=device
     )
+
+    # AMP autocast dtype and scaler
+    autocast_dtype = None
+    scaler = None
+    if device.type == "cuda":
+        if args.precision == "bf16" and torch.cuda.is_bf16_supported():
+            autocast_dtype = torch.bfloat16
+            print("Using bf16 autocast")
+        elif args.precision == "fp16":
+            autocast_dtype = torch.float16
+            scaler = torch.cuda.amp.GradScaler()
+            print("Using fp16 autocast + GradScaler")
+
+    # Optional torch.compile
+    if args.compile_model and hasattr(torch, "compile"):
+        model = torch.compile(model)  # type: ignore
+        print("Model compiled with torch.compile()")
 
     best_val = float("inf")
     best_path = save_dir / "best_model.pt"
@@ -280,6 +356,8 @@ def main():
             horizon_weights,
             log_interval=args.log_interval,
             max_steps=max_train_steps,
+            autocast_dtype=autocast_dtype,
+            scaler=scaler,
         )
         val_loss, val_metrics = evaluate(
             model,
@@ -288,6 +366,7 @@ def main():
             horizon_weights,
             log_interval=0,
             max_steps=max_eval_steps,
+            autocast_dtype=autocast_dtype,
         )
         scheduler.step()
 
