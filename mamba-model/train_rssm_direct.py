@@ -409,15 +409,16 @@ def evaluate(
     count = 0
     for batch in loader:
         if len(batch) == 7:
-            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, _ = batch
+            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = batch
         else:
-            x_cont, x_sym, x_hour, x_dow, _ = batch
+            x_cont, x_sym, x_hour, x_dow, y = batch
             x_base = None
             x_quote = None
         x_cont = x_cont.to(device, non_blocking=True)
         x_sym = x_sym.to(device, non_blocking=True)
         x_hour = x_hour.to(device, non_blocking=True)
         x_dow = x_dow.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         if x_base is not None:
             x_base = x_base.to(device, non_blocking=True)
         if x_quote is not None:
