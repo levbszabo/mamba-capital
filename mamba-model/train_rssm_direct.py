@@ -184,7 +184,10 @@ class ReturnHead(nn.Module):
         )
 
     def forward(self, z_last: torch.Tensor) -> torch.Tensor:
-        return self.net(z_last)
+        # Ensure numeric stability across mixed-precision autocast
+        dtype_in = z_last.dtype
+        out = self.net(z_last.float())
+        return out.to(dtype_in)
 
 
 def parse_args():
