@@ -169,6 +169,24 @@ class SequenceEncoder(nn.Module):
         return z_seq  # [B, L, latent_dim]
 
 
+class ReturnHead(nn.Module):
+    """Predicts window target(s) from the last latent.
+
+    Input: z_last [B, latent_dim]
+    Output: y_pred [B, H]
+    """
+
+    def __init__(self, latent_dim: int, num_horizons: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, num_horizons),
+        )
+
+    def forward(self, z_last: torch.Tensor) -> torch.Tensor:
+        return self.net(z_last)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Direct RSSM training on raw windows")
     p.add_argument("--dataset_dir", type=str, required=True)
@@ -182,6 +200,16 @@ def parse_args():
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--latent_dim", type=int, default=64)
     p.add_argument("--hidden_dim", type=int, default=256)
+    p.add_argument(
+        "--stochastic", action="store_true", help="Enable stochastic latent with KL"
+    )
+    p.add_argument("--kl_beta", type=float, default=1.0)
+    p.add_argument("--kl_free_nats", type=float, default=2.0)
+    p.add_argument(
+        "--overshoot_k", type=int, default=0, help="latent overshooting steps (0=off)"
+    )
+    p.add_argument("--overshoot_lambda", type=float, default=0.1)
+    p.add_argument("--pred_loss_weight", type=float, default=1.0)
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument(
@@ -208,12 +236,18 @@ def parse_args():
 def train_one_epoch(
     encoder: SequenceEncoder,
     rssm: RSSM,
+    ret_head: ReturnHead,
     loader: DataLoader,
     device: torch.device,
     autocast_dtype: torch.dtype | None,
     optimizer: torch.optim.Optimizer,
     diag_every_steps: int,
     diag_max_points: int,
+    pred_loss_weight: float,
+    kl_beta: float,
+    kl_free_nats: float,
+    overshoot_k: int,
+    overshoot_lambda: float,
 ) -> float:
     encoder.train()
     rssm.train()
@@ -242,27 +276,74 @@ def train_one_epoch(
             if autocast_dtype
             else torch.cuda.amp.autocast(enabled=False)
         ):
+            # Observation embedding per step (reuse encoder latent before head)
             Z = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)  # [B,L,Dz]
             B, L, Dz = Z.shape
             z_t = Z[:, :-1, :]
             z_tp1_true = Z[:, 1:, :]
-            # roll GRUCell over time with batch hidden state
             h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=Z.dtype)
-            loss_mse = 0.0
+            latent_loss = torch.tensor(0.0, device=device, dtype=Z.dtype)
+            kl_loss = torch.tensor(0.0, device=device, dtype=Z.dtype)
             steps = 0
-            for t in range(L - 1):
-                z_t_step = z_t[:, t, :]
-                z_pred, h = rssm(z_t_step, h, None)
-                loss_mse = loss_mse + torch.mean(
-                    (z_pred - z_tp1_true[:, t, :].detach()) ** 2
-                )
-                steps += 1
-            loss = loss_mse / max(steps, 1)
+            if rssm.cfg.stochastic:
+                # Stochastic: posterior from (h_prev, obs_embed_t), prior from h_prev
+                for t in range(L - 1):
+                    h_prev = h
+                    mu_p, logv_p = rssm.prior(h_prev)
+                    mu_q, logv_q = rssm.posterior(h_prev, Z[:, t, :])
+                    z_sample = rssm._rsample(mu_q, logv_q)
+                    h = rssm.core(z_sample, h_prev, None)
+                    # predict next latent (use posterior of t+1 as target embed)
+                    latent_loss = latent_loss + torch.mean(
+                        (z_sample - Z[:, t, :].detach()) ** 2
+                    )
+                    # accumulate KL with free nats
+                    kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
+                    kl_loss = kl_loss + torch.mean(
+                        torch.clamp(kl_t - kl_free_nats, min=0.0)
+                    )
+                    steps += 1
+                latent_loss = latent_loss / max(steps, 1)
+                kl_loss = kl_loss / max(steps, 1)
+                if overshoot_k and overshoot_k > 1:
+                    # Simple k-step overshooting on prior
+                    h_os = h.detach()
+                    mu_p, logv_p = rssm.prior(h_os)
+                    for _ in range(overshoot_k - 1):
+                        z_p = rssm._rsample(mu_p, logv_p)
+                        h_os = rssm.core(z_p, h_os, None)
+                        mu_p, logv_p = rssm.prior(h_os)
+                    # Encourage consistency by small KL to a standard normal as proxy
+                    kl_os = 0.5 * torch.sum(
+                        torch.exp(logv_p) + mu_p**2 - 1.0 - logv_p, dim=-1
+                    )
+                    kl_loss = kl_loss + overshoot_lambda * torch.mean(kl_os)
+            else:
+                # Deterministic: one-step prediction MSE
+                loss_mse = 0.0
+                for t in range(L - 1):
+                    z_t_step = z_t[:, t, :]
+                    z_pred, h = rssm.forward_deterministic(z_t_step, h, None)
+                    loss_mse = loss_mse + torch.mean(
+                        (z_pred - z_tp1_true[:, t, :].detach()) ** 2
+                    )
+                    steps += 1
+                latent_loss = loss_mse / max(steps, 1)
+            # Prediction loss from last latent to window targets
+            z_last = Z[:, -1, :]
+            y_pred = ret_head(z_last)
+            pred_loss = torch.mean((y_pred - y) ** 2)
+            loss = latent_loss + pred_loss_weight * pred_loss
+            if rssm.cfg.stochastic:
+                loss = loss + kl_beta * kl_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(encoder.parameters()) + list(rssm.parameters()), 1.0
+            list(encoder.parameters())
+            + list(rssm.parameters())
+            + list(ret_head.parameters()),
+            1.0,
         )
         optimizer.step()
 
@@ -277,33 +358,24 @@ def train_one_epoch(
             with torch.no_grad():
                 z_flat = Z.reshape(-1, Dz)
                 z_std = z_flat.std(dim=0)
+                # Temporal smoothness diagnostic
                 zs_t = z_t.reshape(-1, Dz)
                 zs_tp1 = z_tp1_true.reshape(-1, Dz)
                 cos = torch.nn.functional.cosine_similarity(zs_t, zs_tp1, dim=-1).mean()
-                # Linear probe: predict next target from z_t (first horizon if multi)
-                y_tp1 = y[:, 1:, 0] if y.dim() == 3 else y[:, 1:]
-                Y = y_tp1.reshape(-1, 1)
-                F = zs_t
-                if F.size(0) > diag_max_points:
-                    idx = torch.randperm(F.size(0), device=F.device)[:diag_max_points]
-                    F = F[idx]
-                    Y = Y[idx]
-                Dz_local = F.size(1)
-                lam = 1e-3
-                FtF = F.T @ F + lam * torch.eye(
-                    Dz_local, device=F.device, dtype=F.dtype
+                # Head performance diagnostic on current batch
+                y_hat = ret_head(Z[:, -1, :])
+                y_std = y.std().clamp_min(1e-8)
+                r2 = float(1.0 - torch.mean((y_hat - y) ** 2) / (y_std**2))
+                corr = (
+                    float(
+                        torch.corrcoef(torch.stack([y.flatten(), y_hat.flatten()]))[
+                            0, 1
+                        ].clamp(-1, 1)
+                    )
+                    if y.numel() > 1
+                    else 0.0
                 )
-                FtY = F.T @ Y
-                W = torch.linalg.solve(FtF, FtY)
-                Y_hat = F @ W
-                y_std = Y.std().clamp_min(1e-8)
-                r2 = float(1.0 - torch.mean((Y_hat - Y) ** 2) / (y_std**2))
-                corr = float(
-                    torch.corrcoef(torch.stack([Y.squeeze(), Y_hat.squeeze()]))[
-                        0, 1
-                    ].clamp(-1, 1)
-                )
-                diracc = float((torch.sign(Y_hat) == torch.sign(Y)).float().mean())
+                diracc = float((torch.sign(y_hat) == torch.sign(y)).float().mean())
                 print(
                     {
                         "diag": True,
@@ -311,9 +383,9 @@ def train_one_epoch(
                         "z_std_med": float(z_std.median()),
                         "z_std_max": float(z_std.max()),
                         "z_cos_t_tp1": float(cos),
-                        "probe_r2": r2,
-                        "probe_corr": corr,
-                        "probe_diracc": diracc,
+                        "head_r2": r2,
+                        "head_corr": corr,
+                        "head_diracc": diracc,
                     }
                 )
     return total / max(count, 1)
@@ -323,6 +395,7 @@ def train_one_epoch(
 def evaluate(
     encoder: SequenceEncoder,
     rssm: RSSM,
+    ret_head: ReturnHead,
     loader: DataLoader,
     device: torch.device,
     autocast_dtype: torch.dtype | None,
@@ -357,14 +430,32 @@ def evaluate(
             z_t = Z[:, :-1, :]
             z_tp1_true = Z[:, 1:, :]
             h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=Z.dtype)
-            loss_mse = 0.0
-            steps = 0
-            for t in range(L - 1):
-                z_t_step = z_t[:, t, :]
-                z_pred, h = rssm(z_t_step, h, None)
-                loss_mse = loss_mse + torch.mean((z_pred - z_tp1_true[:, t, :]) ** 2)
-                steps += 1
-            loss = loss_mse / max(steps, 1)
+            if rssm.cfg.stochastic:
+                # Use posterior prediction quality as proxy
+                steps = 0
+                latent_loss = torch.tensor(0.0, device=device, dtype=Z.dtype)
+                for t in range(L - 1):
+                    mu_q, logv_q = rssm.posterior(h, Z[:, t, :])
+                    z_sample = mu_q  # mean as estimate
+                    h = rssm.core(z_sample, h, None)
+                    latent_loss = latent_loss + torch.mean((z_sample - Z[:, t, :]) ** 2)
+                    steps += 1
+                latent_loss = latent_loss / max(steps, 1)
+            else:
+                loss_mse = 0.0
+                steps = 0
+                for t in range(L - 1):
+                    z_t_step = z_t[:, t, :]
+                    z_pred, h = rssm.forward_deterministic(z_t_step, h, None)
+                    loss_mse = loss_mse + torch.mean(
+                        (z_pred - z_tp1_true[:, t, :]) ** 2
+                    )
+                    steps += 1
+                latent_loss = loss_mse / max(steps, 1)
+            z_last = Z[:, -1, :]
+            y_pred = ret_head(z_last)
+            pred_loss = torch.mean((y_pred - y) ** 2)
+            loss = latent_loss + pred_loss
 
         total += float(loss) * B
         count += B
@@ -402,12 +493,22 @@ def main():
         latent_dim=args.latent_dim,
     ).to(device)
 
-    rssm = RSSM(RSSMConfig(latent_dim=args.latent_dim, hidden_dim=args.hidden_dim)).to(
+    rssm = RSSM(
+        RSSMConfig(
+            latent_dim=args.latent_dim,
+            hidden_dim=args.hidden_dim,
+            stochastic=bool(args.stochastic),
+        )
+    ).to(device)
+    num_horizons = int(len(meta["horizons"]))
+    ret_head = ReturnHead(latent_dim=args.latent_dim, num_horizons=num_horizons).to(
         device
     )
 
     optimizer = torch.optim.AdamW(
-        list(encoder.parameters()) + list(rssm.parameters()),
+        list(encoder.parameters())
+        + list(rssm.parameters())
+        + list(ret_head.parameters()),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -431,14 +532,22 @@ def main():
         train_loss = train_one_epoch(
             encoder,
             rssm,
+            ret_head,
             loaders["train"],
             device,
             autocast_dtype,
             optimizer,
             args.diag_every_steps,
             args.diag_max_points,
+            args.pred_loss_weight,
+            args.kl_beta,
+            args.kl_free_nats,
+            args.overshoot_k,
+            args.overshoot_lambda,
         )
-        val_loss = evaluate(encoder, rssm, loaders["val"], device, autocast_dtype)
+        val_loss = evaluate(
+            encoder, rssm, ret_head, loaders["val"], device, autocast_dtype
+        )
         scheduler.step()
         log = {
             "epoch": epoch,
@@ -455,6 +564,7 @@ def main():
                 {
                     "encoder_state": encoder.state_dict(),
                     "rssm_state": rssm.state_dict(),
+                    "ret_head_state": ret_head.state_dict(),
                     "cfg": vars(args),
                     "val_loss": best_val,
                 },
@@ -467,7 +577,11 @@ def main():
         ckpt = torch.load(best_path, map_location=device)
         encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
         rssm.load_state_dict(ckpt["rssm_state"])  # type: ignore
-    test_loss = evaluate(encoder, rssm, loaders["test"], device, autocast_dtype)
+        if "ret_head_state" in ckpt:
+            ret_head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
+    test_loss = evaluate(
+        encoder, rssm, ret_head, loaders["test"], device, autocast_dtype
+    )
     print(json.dumps({"test_loss": test_loss}))
 
 

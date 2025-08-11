@@ -37,60 +37,102 @@ class RSSMConfig:
     hidden_dim: int = 256
     action_dim: int = 0  # set >0 to condition on actions
     dropout: float = 0.0
+    stochastic: bool = True
 
 
 class RSSM(nn.Module):
-    """Deterministic RSSM variant with a GRU transition and linear decoder.
+    """RSSM with deterministic core and optional stochastic latent z.
 
-    Transition:
-      h_{t+1} = GRUCell([z_t, a_t], h_t)
-      zhat_{t+1} = W_out h_{t+1}
-
-    Loss:
-      L = MSE(zhat_{t+1}, z_{t+1}) averaged over batch/sequence.
+    - Deterministic-only mode (stochastic=False): matches prior impl
+    - Stochastic mode (default): prior p(z_t|h_{t-1}), posterior q(z_t|h_{t-1}, e_t)
     """
 
     def __init__(self, cfg: RSSMConfig):
         super().__init__()
         self.cfg = cfg
-        input_dim = cfg.latent_dim + (cfg.action_dim if cfg.action_dim > 0 else 0)
-        self.in_proj = nn.Sequential(
-            nn.LayerNorm(input_dim) if input_dim > 1 else nn.Identity(),
-            nn.Linear(input_dim, cfg.hidden_dim),
+        # Core transition uses z (sampled or deterministic) as input
+        core_in_dim = cfg.latent_dim + (cfg.action_dim if cfg.action_dim > 0 else 0)
+        self.core_in = nn.Sequential(
+            nn.LayerNorm(core_in_dim) if core_in_dim > 1 else nn.Identity(),
+            nn.Linear(core_in_dim, cfg.hidden_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
         )
         self.gru = nn.GRUCell(cfg.hidden_dim, cfg.hidden_dim)
-        self.out_proj = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
 
-        # Small init helps stability
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        if cfg.stochastic:
+            # Prior and posterior parameter heads (μ, logσ^2)
+            self.prior_net = nn.Linear(cfg.hidden_dim, 2 * cfg.latent_dim)
+            self.post_net = nn.Linear(
+                cfg.hidden_dim + cfg.latent_dim, 2 * cfg.latent_dim
+            )
+        else:
+            # Deterministic projection for next z
+            self.out_proj = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
 
-    def forward(
-        self,
-        z_t: torch.Tensor,
-        h_t: torch.Tensor,
-        a_t: Optional[torch.Tensor] = None,
+    def forward_deterministic(
+        self, z_t: torch.Tensor, h_t: torch.Tensor, a_t: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One transition step.
-
-        Args:
-          z_t: [B, latent_dim]
-          h_t: [B, hidden_dim]
-          a_t: [B, action_dim] or None
-        Returns:
-          z_hat_tp1: [B, latent_dim]
-          h_tp1: [B, hidden_dim]
-        """
         if a_t is not None and self.cfg.action_dim > 0:
             x = torch.cat([z_t, a_t], dim=-1)
         else:
             x = z_t
-        x = self.in_proj(x)
+        x = self.core_in(x)
         h_tp1 = self.gru(x, h_t)
         z_hat_tp1 = self.out_proj(h_tp1)
         return z_hat_tp1, h_tp1
+
+    @staticmethod
+    def _split_stats(stats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mu, logvar = torch.chunk(stats, 2, dim=-1)
+        return mu, logvar
+
+    @staticmethod
+    def _rsample(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + std * eps
+
+    @staticmethod
+    def kl_gaussian(
+        mu_q: torch.Tensor,
+        logvar_q: torch.Tensor,
+        mu_p: torch.Tensor,
+        logvar_p: torch.Tensor,
+    ) -> torch.Tensor:
+        # KL(q||p) for diagonal Gaussians
+        var_q = torch.exp(logvar_q)
+        var_p = torch.exp(logvar_p)
+        kl = 0.5 * ((logvar_p - logvar_q) + (var_q + (mu_q - mu_p) ** 2) / var_p - 1.0)
+        return kl.sum(dim=-1)  # sum over latent dims
+
+    def posterior(
+        self, h_prev: torch.Tensor, obs_embed: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.cfg.stochastic, "posterior only in stochastic mode"
+        stats = self.post_net(torch.cat([h_prev, obs_embed], dim=-1))
+        return self._split_stats(stats)
+
+    def prior(self, h_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.cfg.stochastic, "prior only in stochastic mode"
+        stats = self.prior_net(h_prev)
+        return self._split_stats(stats)
+
+    def core(
+        self,
+        z_t: torch.Tensor,
+        h_prev: torch.Tensor,
+        a_t: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if a_t is not None and self.cfg.action_dim > 0:
+            x = torch.cat([z_t, a_t], dim=-1)
+        else:
+            x = z_t
+        x = self.core_in(x)
+        h_t = self.gru(x, h_prev)
+        return h_t
 
     def imagine(
         self,
@@ -123,7 +165,13 @@ class RSSM(nn.Module):
             a = None
             if self.cfg.action_dim > 0 and policy_fn is not None:
                 a = policy_fn(z)
-            z, h = self.forward(z, h, a)
+            if self.cfg.stochastic:
+                # Use prior for imagination
+                mu_p, logvar_p = self.prior(h)
+                z = self._rsample(mu_p, logvar_p)
+                h = self.core(z, h, a)
+            else:
+                z, h = self.forward_deterministic(z, h, a)
             traj.append(z)
         return torch.stack(traj, dim=1)
 
