@@ -185,6 +185,18 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument(
+        "--diag_every_steps",
+        type=int,
+        default=500,
+        help="Print latent diagnostics every N train steps",
+    )
+    p.add_argument(
+        "--diag_max_points",
+        type=int,
+        default=20000,
+        help="Max points for linear probe diagnostics",
+    )
+    p.add_argument(
         "--precision",
         type=str,
         choices=["fp32", "bf16", "fp16"],
@@ -200,6 +212,8 @@ def train_one_epoch(
     device: torch.device,
     autocast_dtype: torch.dtype | None,
     optimizer: torch.optim.Optimizer,
+    diag_every_steps: int,
+    diag_max_points: int,
 ) -> float:
     encoder.train()
     rssm.train()
@@ -208,15 +222,16 @@ def train_one_epoch(
     start = time.time()
     for step, batch in enumerate(loader, 1):
         if len(batch) == 7:
-            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, _ = batch
+            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = batch
         else:
-            x_cont, x_sym, x_hour, x_dow, _ = batch
+            x_cont, x_sym, x_hour, x_dow, y = batch
             x_base = None
             x_quote = None
         x_cont = x_cont.to(device, non_blocking=True)
         x_sym = x_sym.to(device, non_blocking=True)
         x_hour = x_hour.to(device, non_blocking=True)
         x_dow = x_dow.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
         if x_base is not None:
             x_base = x_base.to(device, non_blocking=True)
         if x_quote is not None:
@@ -257,6 +272,50 @@ def train_one_epoch(
             print(
                 f"train step {step}/{len(loader)}: avg_loss={total/max(count,1):.6f} elapsed={time.time()-start:.1f}s"
             )
+        # Diagnostics
+        if diag_every_steps > 0 and (step % diag_every_steps == 0):
+            with torch.no_grad():
+                z_flat = Z.reshape(-1, Dz)
+                z_std = z_flat.std(dim=0)
+                zs_t = z_t.reshape(-1, Dz)
+                zs_tp1 = z_tp1_true.reshape(-1, Dz)
+                cos = torch.nn.functional.cosine_similarity(zs_t, zs_tp1, dim=-1).mean()
+                # Linear probe: predict next target from z_t (first horizon if multi)
+                y_tp1 = y[:, 1:, 0] if y.dim() == 3 else y[:, 1:]
+                Y = y_tp1.reshape(-1, 1)
+                F = zs_t
+                if F.size(0) > diag_max_points:
+                    idx = torch.randperm(F.size(0), device=F.device)[:diag_max_points]
+                    F = F[idx]
+                    Y = Y[idx]
+                Dz_local = F.size(1)
+                lam = 1e-3
+                FtF = F.T @ F + lam * torch.eye(
+                    Dz_local, device=F.device, dtype=F.dtype
+                )
+                FtY = F.T @ Y
+                W = torch.linalg.solve(FtF, FtY)
+                Y_hat = F @ W
+                y_std = Y.std().clamp_min(1e-8)
+                r2 = float(1.0 - torch.mean((Y_hat - Y) ** 2) / (y_std**2))
+                corr = float(
+                    torch.corrcoef(torch.stack([Y.squeeze(), Y_hat.squeeze()]))[
+                        0, 1
+                    ].clamp(-1, 1)
+                )
+                diracc = float((torch.sign(Y_hat) == torch.sign(Y)).float().mean())
+                print(
+                    {
+                        "diag": True,
+                        "z_std_min": float(z_std.min()),
+                        "z_std_med": float(z_std.median()),
+                        "z_std_max": float(z_std.max()),
+                        "z_cos_t_tp1": float(cos),
+                        "probe_r2": r2,
+                        "probe_corr": corr,
+                        "probe_diracc": diracc,
+                    }
+                )
     return total / max(count, 1)
 
 
