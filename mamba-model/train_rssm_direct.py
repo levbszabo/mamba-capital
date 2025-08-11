@@ -586,7 +586,7 @@ def main():
     test_loss = evaluate(
         encoder, rssm, ret_head, loaders["test"], device, autocast_dtype
     )
-    print(json.dumps({"test_loss": test_loss}))
+    print(json.dumps({"test_loss": tesst_loss}))
 
 
 if __name__ == "__main__":
