@@ -97,6 +97,10 @@ def train_one_epoch(
         x_sym = x_sym.to(device, non_blocking=True)
         x_hour = x_hour.to(device, non_blocking=True)
         x_dow = x_dow.to(device, non_blocking=True)
+        if x_base is not None:
+            x_base = x_base.to(device, non_blocking=True)
+        if x_quote is not None:
+            x_quote = x_quote.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
@@ -169,6 +173,10 @@ def evaluate(
         x_sym = x_sym.to(device, non_blocking=True)
         x_hour = x_hour.to(device, non_blocking=True)
         x_dow = x_dow.to(device, non_blocking=True)
+        if x_base is not None:
+            x_base = x_base.to(device, non_blocking=True)
+        if x_quote is not None:
+            x_quote = x_quote.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         with (
             torch.autocast("cuda", dtype=autocast_dtype)
