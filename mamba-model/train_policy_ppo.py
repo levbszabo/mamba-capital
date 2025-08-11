@@ -1,12 +1,11 @@
 """
-Train a simple PPO policy on top of RSSM latents using imagined rollouts.
+Train a PPO policy on top of a pretrained Dreamer-style world model.
 
-Observations: z_t (latent from encoder)
+Observations: z_t (latent from encoder + RSSM posterior/prior)
 Actions: continuous position in [-1, 1]
-Rewards: return head prediction minus transaction costs; optional real returns on on-policy real rollouts
+Reward (imagination): a * mu - tc * |Δa| - lambda_unc * sigma
 
-This script does a minimal PPO update loop to demonstrate end-to-end RL with
-the world model. It prints finance-relevant metrics: Sharpe, drawdown, coverage.
+Policy is trained purely in imagination (prior rollouts) with costs.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from torch.distributions import Normal, Independent
 from torch.utils.data import DataLoader, TensorDataset
 
 from rssm import RSSM, RSSMConfig
-from train_rssm_direct import SequenceEncoder, ReturnHead
+from world_model import ObsEncoder, ReturnHead
 
 
 def load_split(dataset_dir: Path, split: str) -> Dict[str, torch.Tensor]:
@@ -103,8 +102,8 @@ def max_drawdown(equity: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def rollout_imagination(encoder, rssm, head, batch, horizon: int, device):
-    # Encode to z0
+def rollout_imagination(encoder, rssm, batch, device):
+    # Encode to last posterior mean latent
     if len(batch) == 7:
         x_cont, x_sym, x_hour, x_dow, x_base, x_quote, _ = batch
     else:
@@ -119,15 +118,26 @@ def rollout_imagination(encoder, rssm, head, batch, horizon: int, device):
         x_base = x_base.to(device)
     if x_quote is not None:
         x_quote = x_quote.to(device)
-    Z = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
-    z0 = Z[:, -1, :]
-    return z0
+    E = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
+    B, L, _ = E.shape
+    h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
+    z_t = None
+    for t in range(L):
+        mu_p, logv_p = rssm.prior(h)
+        mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+        z_t = mu_q
+        h = rssm.core(z_t, h, None)
+    assert z_t is not None
+    return z_t
 
 
 def main():
     ap = argparse.ArgumentParser(description="Train PPO policy with RSSM imagination")
     ap.add_argument("--dataset_dir", type=str, required=True)
     ap.add_argument("--checkpoint", type=str, required=True)
+    ap.add_argument(
+        "--lambda_unc", type=float, default=0.0, help="uncertainty penalty in reward"
+    )
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--horizon", type=int, default=16)
@@ -145,27 +155,30 @@ def main():
     horizons = meta["horizons"]
     num_horizons = len(horizons)
 
-    encoder = SequenceEncoder(
+    encoder = ObsEncoder(
         num_cont_features=len(feature_names),
         num_symbols=int(vocab["num_symbols"]),
         hour_size=int(vocab["hour_size"]),
         dow_size=int(vocab["dow_size"]),
         num_bases=int(vocab.get("num_bases", 0)) or None,
         num_quotes=int(vocab.get("num_quotes", 0)) or None,
-        latent_dim=64,
+        embed_dim=64,
         d_model=256,
         n_layers=2,
     ).to(device)
     rssm = RSSM(RSSMConfig(latent_dim=64, hidden_dim=256, stochastic=True)).to(device)
-    head = ReturnHead(latent_dim=64, num_horizons=num_horizons).to(device)
     ckpt = torch.load(Path(args.checkpoint), map_location=device)
     encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
     rssm.load_state_dict(ckpt["rssm_state"])  # type: ignore
-    if "ret_head_state" in ckpt:
-        head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
     encoder.eval()
     rssm.eval()
-    head.eval()
+
+    # Optional return head for reward proxy
+    ret_head = None
+    if "ret_head_state" in ckpt:
+        ret_head = ReturnHead(latent_dim=64, num_horizons=num_horizons).to(device)
+        ret_head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
+        ret_head.eval()
 
     actor = Actor(latent_dim=64).to(device)
     critic = Critic(latent_dim=64).to(device)
@@ -201,7 +214,7 @@ def main():
         rew_buf = []
         val_buf = []
         for batch in train_loader:
-            z = rollout_imagination(encoder, rssm, head, batch, args.horizon, device)
+            z = rollout_imagination(encoder, rssm, batch, device)
             # rollout in latent space with policy
             h = None
             zs = [z]
@@ -213,9 +226,16 @@ def main():
                 a = dist.sample().clamp(-1.0, 1.0)
                 logp = dist.log_prob(a)
                 # reward: head prediction (use first horizon) minus turnover cost
-                mu = head(z)[:, 0:1]
+                # Predict reward proxy using return head if available in checkpoint
+                if ret_head is not None:
+                    mu, logv = ret_head(z)
+                    mu = mu[:, 0:1].detach()
+                    sig = torch.exp(0.5 * logv[:, 0:1]).detach()
+                else:
+                    mu = torch.zeros_like(a)
+                    sig = torch.zeros_like(a)
                 cost = (a - (acts[-1] if acts else torch.zeros_like(a))).abs() * bp
-                r = (a * mu - cost).squeeze(-1)
+                r = (a * mu - cost - args.lambda_unc * sig).squeeze(-1)
                 v = critic(z)
                 # RSSM prior step
                 mu_p, logv_p = rssm.prior(
@@ -301,39 +321,7 @@ def main():
                 opt_vf.step()
 
         # Quick validation PnL using head sign policy
-        with torch.no_grad():
-            val_loader_iter = DataLoader(
-                TensorDataset(
-                    val["x_cont"],
-                    val["x_symbol_id"],
-                    val["x_ny_hour_id"],
-                    val["x_ny_dow_id"],
-                    val["y"],
-                ),
-                batch_size=256,
-            )
-            pnl_all = []
-            for xb in val_loader_iter:
-                x_cont, x_sym, x_hour, x_dow, y = [t.to(device) for t in xb]
-                Z = encoder(x_cont, x_sym, x_hour, x_dow, None, None)
-                mu = head(Z[:, -1, :])[:, 0]
-                pos = torch.sign(mu)
-                pnl = (pos * y[:, 0]) - (
-                    pos.diff(dim=0, prepend=torch.zeros_like(pos)).abs()
-                    * (args.txn_cost_bp * 1e-4)
-                )
-                pnl_all.append(pnl.cpu())
-            pnl = torch.cat(pnl_all).numpy()
-            equity = np.cumsum(pnl)
-            print(
-                {
-                    "epoch": epoch,
-                    "train_samples": int(B * T),
-                    "val_sharpe": sharpe_ratio(pnl),
-                    "val_mdd": max_drawdown(equity),
-                    "val_final_equity": float(equity[-1]) if len(equity) > 0 else 0.0,
-                }
-            )
+        # Optionally: add validation PnL here using saved return head from world model
 
 
 if __name__ == "__main__":

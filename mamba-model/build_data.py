@@ -61,7 +61,7 @@ class BuildConfig:
     symbols: Optional[List[str]]
     standardize_targets: bool
     splits: TimeSplits
-    horizons: Tuple[int, int, int] = (1, 6, 24)
+    horizons: Tuple[int, ...] = (6, 24, 168, 720)
 
 
 # -----------------------------
@@ -365,7 +365,7 @@ def apply_per_symbol_scalers(
 
 def fit_target_scalers(
     data: pd.DataFrame,
-    horizons: Tuple[int, int, int],
+    horizons: Tuple[int, ...],
     split_col: str = "split",
 ) -> Dict[str, Dict[str, Tuple[float, float]]]:
     target_cols = [f"fwd_ret_log_{h}h" for h in horizons]
@@ -388,7 +388,7 @@ def fit_target_scalers(
 
 def apply_target_scalers(
     data: pd.DataFrame,
-    horizons: Tuple[int, int, int],
+    horizons: Tuple[int, ...],
     target_scalers: Dict[str, Dict[str, Tuple[float, float]]],
 ) -> pd.DataFrame:
     data = data.copy()
@@ -421,7 +421,7 @@ def _windowize_symbol(
     base_id: Optional[int],
     quote_id: Optional[int],
     continuous_features: List[str],
-    horizons: Tuple[int, int, int],
+    horizons: Tuple[int, ...],
     sequence_length: int,
     stride: int,
 ) -> Tuple[
@@ -472,6 +472,8 @@ def _windowize_symbol(
             np.zeros((0, sequence_length), dtype=np.int64),
             np.zeros((0, sequence_length), dtype=np.int64),
             np.zeros((0, sequence_length), dtype=np.int64),
+            None,
+            None,
             np.zeros((0, len(horizons)), dtype=np.float32),
             [],
         )
@@ -522,6 +524,8 @@ def _windowize_symbol(
             np.zeros((0, sequence_length), dtype=np.int64),
             np.zeros((0, sequence_length), dtype=np.int64),
             np.zeros((0, sequence_length), dtype=np.int64),
+            None,
+            None,
             np.zeros((0, len(horizons)), dtype=np.float32),
             [],
         )
@@ -545,7 +549,7 @@ def build_windows(
     data: pd.DataFrame,
     vocab: Dict[str, Dict],
     continuous_features: List[str],
-    horizons: Tuple[int, int, int],
+    horizons: Tuple[int, ...],
     sequence_length: int,
     train_stride: int,
     eval_stride: int,
@@ -704,8 +708,8 @@ def parse_args() -> BuildConfig:
         "--target_horizons",
         type=int,
         nargs="+",
-        default=[1],
-        help="Future return horizons in hours (e.g., --target_horizons 6 or 1 6 24)",
+        default=[6, 24, 168, 720],
+        help="Future return horizons in hours (e.g., 6 24 168 720)",
     )
     # Defaults favoring larger train, compact validation (Q4 2024), and test (2025+)
     parser.add_argument("--train_end", type=str, default="2024-09-30 23:00:00+00:00")
@@ -739,7 +743,9 @@ def parse_args() -> BuildConfig:
         symbols=args.symbols,
         standardize_targets=not bool(args.no_standardize_targets),
         splits=splits,
-        horizons=tuple([int(h) for h in getattr(args, "target_horizons", [1])]),
+        horizons=tuple(
+            [int(h) for h in getattr(args, "target_horizons", [6, 24, 168, 720])]
+        ),
     )
     return cfg
 

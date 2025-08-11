@@ -115,9 +115,13 @@ def main():
     rssm.eval()
     head.eval()
 
+    # Get target scalers for descaling
+    target_scalers = meta.get("target_scalers", {})
+
     # Collect predictions and targets
     Y_list: List[torch.Tensor] = []
     YH_list: List[torch.Tensor] = []
+    SYM_list: List[torch.Tensor] = []  # track symbols for descaling
     for batch in loader:
         if len(batch) == 7:
             x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = batch
@@ -139,9 +143,26 @@ def main():
         y_hat = head(z_last)
         Y_list.append(y)
         YH_list.append(y_hat.cpu())
+        SYM_list.append(x_sym.cpu())
 
     Y = torch.cat(Y_list, dim=0).cpu().numpy()  # [N, H]
     YH = torch.cat(YH_list, dim=0).cpu().numpy()
+    SYM = torch.cat(SYM_list, dim=0).cpu().numpy()  # [N]
+
+    # Descale targets and predictions if scalers available
+    if target_scalers:
+        vocab_symbols = meta["vocab"]["symbols"]
+        for i in range(Y.shape[0]):
+            sym_id = int(SYM[i])
+            if sym_id < len(vocab_symbols):
+                symbol = vocab_symbols[sym_id]
+                if symbol in target_scalers:
+                    scaler = target_scalers[symbol]
+                    mean_vals = np.array(scaler["mean"])
+                    std_vals = np.array(scaler["std"])
+                    # Descale: y_orig = y_scaled * std + mean
+                    Y[i, :] = Y[i, :] * std_vals + mean_vals
+                    YH[i, :] = YH[i, :] * std_vals + mean_vals
 
     # Evaluate per horizon
     for h_idx, h in enumerate(horizons):

@@ -296,9 +296,9 @@ def train_one_epoch(
                     mu_q, logv_q = rssm.posterior(h_prev, Z[:, t, :])
                     z_sample = rssm._rsample(mu_q, logv_q)
                     h = rssm.core(z_sample, h_prev, None)
-                    # predict next latent (use posterior of t+1 as target embed)
+                    # predict next latent (use encoder output at t+1 as target)
                     latent_loss = latent_loss + torch.mean(
-                        (z_sample - Z[:, t, :].detach()) ** 2
+                        (z_sample - Z[:, t + 1, :].detach()) ** 2
                     )
                     # accumulate KL with free nats
                     kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
@@ -586,7 +586,7 @@ def main():
     test_loss = evaluate(
         encoder, rssm, ret_head, loaders["test"], device, autocast_dtype
     )
-    print(json.dumps({"test_loss": tesst_loss}))
+    print(json.dumps({"test_loss": test_loss}))
 
 
 if __name__ == "__main__":
