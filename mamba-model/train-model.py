@@ -29,8 +29,8 @@ def load_tensors(dataset_dir: Path) -> Tuple[Dict[str, Dict[str, torch.Tensor]],
     data: Dict[str, Dict[str, torch.Tensor]] = {}
     for split in ["train", "val", "test"]:
         path = dataset_dir / f"dataset_{split}.pt"
-        data[split] = torch.load(path, map_location="cpu")
-    meta_pt = torch.load(dataset_dir / "meta.pt", map_location="cpu")
+        data[split] = torch.load(path, map_location="cpu", weights_only=True)
+    meta_pt = torch.load(dataset_dir / "meta.pt", map_location="cpu", weights_only=True)
     return data, meta_pt
 
 
@@ -354,10 +354,11 @@ def main():
             scaler = torch.cuda.amp.GradScaler()
             print("Using fp16 autocast + GradScaler")
 
-    # Optional torch.compile
+    # Optional torch.compile (disabled due to device propagation issues with optional embeddings)
     if args.compile_model and hasattr(torch, "compile"):
-        model = torch.compile(model)  # type: ignore
-        print("Model compiled with torch.compile()")
+        print("Model compilation disabled due to FakeTensor device propagation issues")
+        # model = torch.compile(model)  # type: ignore
+        # print("Model compiled with torch.compile()")
 
     best_val = float("inf")
     best_path = save_dir / "best_model.pt"
