@@ -700,6 +700,13 @@ def parse_args() -> BuildConfig:
         action="store_true",
         help="If set, do not standardize forward targets",
     )
+    parser.add_argument(
+        "--target_horizons",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="Future return horizons in hours (e.g., --target_horizons 6 or 1 6 24)",
+    )
     # Defaults favoring larger train, compact validation (Q4 2024), and test (2025+)
     parser.add_argument("--train_end", type=str, default="2024-09-30 23:00:00+00:00")
     parser.add_argument("--val_start", type=str, default="2024-10-01 00:00:00+00:00")
