@@ -429,7 +429,14 @@ def main():
         print(f"\nEpoch {epoch}/{args.epochs}")
         t0 = time.time()
         train_loss = train_one_epoch(
-            encoder, rssm, loaders["train"], device, autocast_dtype, optimizer
+            encoder,
+            rssm,
+            loaders["train"],
+            device,
+            autocast_dtype,
+            optimizer,
+            args.diag_every_steps,
+            args.diag_max_points,
         )
         val_loss = evaluate(encoder, rssm, loaders["val"], device, autocast_dtype)
         scheduler.step()
