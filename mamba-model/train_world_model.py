@@ -16,6 +16,7 @@ import json
 import time
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -102,6 +103,30 @@ def parse_args():
         default="bf16" if torch.cuda.is_available() else "fp32",
     )
     p.add_argument("--diag_every_steps", type=int, default=500)
+    # Validation metrics printing
+    p.add_argument(
+        "--val_metrics_every_epochs",
+        type=int,
+        default=1,
+        help="Print detailed validation metrics every N epochs (0 to disable)",
+    )
+    p.add_argument(
+        "--val_metrics_max_points",
+        type=int,
+        default=8000,
+        help="Max number of validation samples to use for quick metrics",
+    )
+    p.add_argument(
+        "--val_use_zscore",
+        action="store_true",
+        help="Use |mu/sigma| for confidence gating metrics",
+    )
+    p.add_argument(
+        "--val_txn_cost_bp",
+        type=float,
+        default=0.5,
+        help="Txn costs (basis points) used for quick validation PnL",
+    )
     return p.parse_args()
 
 
@@ -205,6 +230,53 @@ def train_one_epoch(
                 f"[🚀 Train] step {step:>4}/{len(loader):<4} | 🎯 total {avg_total:8.5f} "
                 f"= 🧩 recon {recon_weight}×{avg_recon:7.5f} + 🔗 β{kl_beta}×KL {avg_kl:7.5f} + 📈 λ{ret_weight}×NLL {avg_y:7.5f} | ⏱ {time.time()-start:.1f}s"
             )
+            # Quick edge proxies on current batch (first horizon)
+            with torch.no_grad():
+                mu_h = mu_y[:, 0]
+                y_h = y[:, 0]
+                sig_h = torch.exp(0.5 * logv_y[:, 0]).clamp_min(1e-8)
+                z = mu_h / sig_h
+                # Pearson IC
+                if mu_h.std() > 0 and y_h.std() > 0:
+                    ic = float(
+                        torch.corrcoef(torch.stack([mu_h, y_h]))[0, 1].clamp(-1, 1)
+                    )
+                else:
+                    ic = 0.0
+                # Spearman via ranks
+                r_mu = torch.argsort(torch.argsort(mu_h))
+                r_y = torch.argsort(torch.argsort(y_h))
+                if r_mu.float().std() > 0 and r_y.float().std() > 0:
+                    ic_s = float(
+                        torch.corrcoef(torch.stack([r_mu.float(), r_y.float()]))[0, 1]
+                    )
+                else:
+                    ic_s = 0.0
+                diracc = float((torch.sign(mu_h) == torch.sign(y_h)).float().mean())
+                edge = float((torch.sign(mu_h) * y_h).mean())
+                # Top-20% by |z|
+                thr = torch.quantile(z.abs(), 0.8)
+                mask = z.abs() >= thr
+                if mask.any():
+                    diracc_top = float(
+                        (torch.sign(mu_h[mask]) == torch.sign(y_h[mask])).float().mean()
+                    )
+                    edge_top = float((torch.sign(mu_h[mask]) * y_h[mask]).mean())
+                else:
+                    diracc_top = float("nan")
+                    edge_top = float("nan")
+                z_mean = float(z.abs().mean())
+            print(
+                {
+                    "ic": ic,
+                    "ic_s": ic_s,
+                    "diracc": diracc,
+                    "diracc@20": diracc_top,
+                    "edge": edge,
+                    "edge@20": edge_top,
+                    "z_mean": z_mean,
+                }
+            )
         if diag_every_steps > 0 and (step % diag_every_steps == 0):
             with torch.no_grad():
                 # Simple z statistic: run encoder again last batch
@@ -307,6 +379,106 @@ def evaluate(
         f"🔗 KL β={kl_beta}, free_nats={kl_free_nats} → {avg_kl:.6f} | 📈 λ={ret_weight}×yNLL {avg_y:.6f}"
     )
     return avg_total
+
+
+@torch.no_grad()
+def quick_val_metrics(
+    encoder: ObsEncoder,
+    rssm: RSSM,
+    head: ReturnHead,
+    loader: DataLoader,
+    device: torch.device,
+    max_points: int = 8000,
+    use_zscore: bool = True,
+    txn_cost_bp: float = 0.5,
+) -> None:
+    """Lightweight validation metrics for immediate feedback.
+
+    Prints per-horizon: corr, diracc, diracc@20, RMSE, and a simple costs-aware Sharpe using sign(mu).
+    Uses at most `max_points` samples for speed.
+    """
+    MU_list: list[torch.Tensor] = []
+    SIG_list: list[torch.Tensor] = []
+    Y_list: list[torch.Tensor] = []
+    N_total = 0
+    for xb in loader:
+        # Support optional base/quote
+        if len(xb) == 7:
+            x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = xb
+        else:
+            x_cont, x_sym, x_hour, x_dow, y = xb
+            x_base = None
+            x_quote = None
+        x_cont = x_cont.to(device)
+        x_sym = x_sym.to(device)
+        x_hour = x_hour.to(device)
+        x_dow = x_dow.to(device)
+        if x_base is not None:
+            x_base = x_base.to(device)
+        if x_quote is not None:
+            x_quote = x_quote.to(device)
+        y = y.to(device)
+
+        E = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
+        B, L, _ = E.shape
+        h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
+        z_t = None
+        for t in range(L):
+            mu_p, logv_p = rssm.prior(h)
+            mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+            z_t = mu_q
+            h = rssm.core(z_t, h, None)
+        assert z_t is not None
+        mu_y, logv_y = head(z_t)
+        MU_list.append(mu_y.detach().cpu())
+        SIG_list.append(torch.exp(0.5 * logv_y).detach().cpu())
+        Y_list.append(y.detach().cpu())
+        N_total += y.size(0)
+        if N_total >= max_points:
+            break
+
+    if not MU_list:
+        print('{"val_metrics": "no samples"}')
+        return
+
+    MU = torch.cat(MU_list, dim=0).numpy()
+    SIG = torch.cat(SIG_list, dim=0).numpy()
+    Y = torch.cat(Y_list, dim=0).numpy()
+
+    num_horizons = MU.shape[1]
+    cost = txn_cost_bp * 1e-4
+    for h_idx in range(num_horizons):
+        mu = MU[:, h_idx]
+        sig = SIG[:, h_idx]
+        yt = Y[:, h_idx]
+        rmse = float(np.sqrt(np.mean((mu - yt) ** 2)))
+        corr = (
+            float(np.corrcoef(mu, yt)[0, 1]) if mu.std() > 0 and yt.std() > 0 else 0.0
+        )
+        diracc = float(np.mean(np.sign(mu) == np.sign(yt)))
+        score = np.abs(mu / np.maximum(sig, 1e-6)) if use_zscore else np.abs(mu)
+        thr = np.quantile(score, 0.8)
+        mask = score >= thr
+        diracc_top = (
+            float(np.mean(np.sign(mu[mask]) == np.sign(yt[mask])))
+            if mask.any()
+            else float("nan")
+        )
+        # Simple costs-aware Sharpe for baseline sign(mu)
+        pos = np.sign(mu)
+        pnl = pos * yt - np.abs(np.diff(pos, prepend=0)) * cost
+        shrp = float(pnl.mean() / (pnl.std() + 1e-9))
+        print(
+            {
+                "val_quick": True,
+                "h_idx": h_idx,
+                "rmse": rmse,
+                "corr": corr,
+                "diracc": diracc,
+                "diracc@20": diracc_top,
+                "baseline_sign_mu_sharpe": shrp,
+            }
+        )
 
 
 def main():
@@ -417,6 +589,19 @@ def main():
             args.ret_weight,
             args.recon_weight,
         )
+        if args.val_metrics_every_epochs and (
+            epoch % args.val_metrics_every_epochs == 0
+        ):
+            quick_val_metrics(
+                encoder,
+                rssm,
+                head,
+                loaders["val"],
+                device,
+                max_points=args.val_metrics_max_points,
+                use_zscore=args.val_use_zscore,
+                txn_cost_bp=args.val_txn_cost_bp,
+            )
         scheduler.step()
         log = {
             "epoch": epoch,
