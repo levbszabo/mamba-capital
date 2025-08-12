@@ -178,15 +178,24 @@ class ObsDecoder(nn.Module):
 
 
 class ReturnHead(nn.Module):
-    """Predict heteroscedastic future returns for multiple horizons from z_last."""
+    """Predict heteroscedastic future returns for multiple horizons from z_last.
+
+    Uses a tiny MLP for mild nonlinearity to help μ move without overfitting.
+    """
 
     def __init__(self, latent_dim: int, num_horizons: int) -> None:
         super().__init__()
         self.mu = nn.Sequential(
-            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, num_horizons)
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, num_horizons),
         )
         self.logvar = nn.Sequential(
-            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, num_horizons)
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, num_horizons),
         )
 
     def forward(self, z_last: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

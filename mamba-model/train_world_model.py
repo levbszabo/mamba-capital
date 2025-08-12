@@ -199,7 +199,9 @@ def train_one_epoch(
             # Return head on last latent h state: need last z_t; reuse mu_q of last step's sample
             # For numerical stability, feed last latent derived from last posterior sample
             mu_y, logv_y = head(z_t)
-            y_loss = gaussian_nll(y, mu_y, logv_y)
+            # Encourage meaningful means: clamp variance and add tiny penalty
+            logv_y = logv_y.clamp(min=-6.0, max=2.0)
+            y_loss = gaussian_nll(y, mu_y, logv_y) + 1e-6 * (logv_y**2).mean()
 
             loss = recon_weight * recon_loss + kl_beta * kl_loss + ret_weight * y_loss
 
