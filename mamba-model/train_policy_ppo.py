@@ -155,6 +155,11 @@ def main():
     horizons = meta["horizons"]
     num_horizons = len(horizons)
 
+    ckpt = torch.load(Path(args.checkpoint), map_location=device)
+    cfg_ckpt = ckpt.get("cfg", {})
+    latent_dim = int(cfg_ckpt.get("latent_dim", 64))
+    hidden_dim = int(cfg_ckpt.get("hidden_dim", 256))
+
     encoder = ObsEncoder(
         num_cont_features=len(feature_names),
         num_symbols=int(vocab["num_symbols"]),
@@ -162,12 +167,13 @@ def main():
         dow_size=int(vocab["dow_size"]),
         num_bases=int(vocab.get("num_bases", 0)) or None,
         num_quotes=int(vocab.get("num_quotes", 0)) or None,
-        embed_dim=64,
-        d_model=256,
+        embed_dim=latent_dim,
+        d_model=hidden_dim,
         n_layers=2,
     ).to(device)
-    rssm = RSSM(RSSMConfig(latent_dim=64, hidden_dim=256, stochastic=True)).to(device)
-    ckpt = torch.load(Path(args.checkpoint), map_location=device)
+    rssm = RSSM(
+        RSSMConfig(latent_dim=latent_dim, hidden_dim=hidden_dim, stochastic=True)
+    ).to(device)
     encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
     rssm.load_state_dict(ckpt["rssm_state"])  # type: ignore
     encoder.eval()
@@ -176,12 +182,14 @@ def main():
     # Optional return head for reward proxy
     ret_head = None
     if "ret_head_state" in ckpt:
-        ret_head = ReturnHead(latent_dim=64, num_horizons=num_horizons).to(device)
+        ret_head = ReturnHead(latent_dim=latent_dim, num_horizons=num_horizons).to(
+            device
+        )
         ret_head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
         ret_head.eval()
 
-    actor = Actor(latent_dim=64).to(device)
-    critic = Critic(latent_dim=64).to(device)
+    actor = Actor(latent_dim=latent_dim).to(device)
+    critic = Critic(latent_dim=latent_dim).to(device)
     cfg = PPOConfig()
     opt_pi = torch.optim.Adam(actor.parameters(), lr=cfg.pi_lr)
     opt_vf = torch.optim.Adam(critic.parameters(), lr=cfg.vf_lr)

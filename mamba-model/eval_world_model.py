@@ -77,7 +77,13 @@ def main():
         ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, pin_memory=True)
 
-    # Rebuild model
+    # Load checkpoint to get architecture dims
+    ckpt = torch.load(Path(args.checkpoint), map_location=device)
+    cfg = ckpt.get("cfg", {})
+    latent_dim = int(cfg.get("latent_dim", 64))
+    hidden_dim = int(cfg.get("hidden_dim", 256))
+
+    # Rebuild model using checkpoint dims
     encoder = ObsEncoder(
         num_cont_features=len(feature_names),
         num_symbols=int(vocab["num_symbols"]),
@@ -85,16 +91,19 @@ def main():
         dow_size=int(vocab["dow_size"]),
         num_bases=int(vocab.get("num_bases", 0)) or None,
         num_quotes=int(vocab.get("num_quotes", 0)) or None,
-        embed_dim=64,
-        d_model=256,
+        embed_dim=latent_dim,
+        d_model=hidden_dim,
         n_layers=2,
         dropout=0.1,
     ).to(device)
-    rssm = RSSM(RSSMConfig(latent_dim=64, hidden_dim=256, stochastic=True)).to(device)
-    decoder = ObsDecoder(latent_dim=64, num_cont_features=len(feature_names)).to(device)
-    head = ReturnHead(latent_dim=64, num_horizons=num_horizons).to(device)
+    rssm = RSSM(
+        RSSMConfig(latent_dim=latent_dim, hidden_dim=hidden_dim, stochastic=True)
+    ).to(device)
+    decoder = ObsDecoder(
+        latent_dim=latent_dim, num_cont_features=len(feature_names)
+    ).to(device)
+    head = ReturnHead(latent_dim=latent_dim, num_horizons=num_horizons).to(device)
 
-    ckpt = torch.load(Path(args.checkpoint), map_location=device)
     encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
     rssm.load_state_dict(ckpt["rssm_state"])  # type: ignore
     decoder.load_state_dict(ckpt["decoder_state"])  # type: ignore
