@@ -126,6 +126,9 @@ def train_one_epoch(
     head.train()
     total = 0.0
     count = 0
+    recon_total = 0.0
+    kl_total = 0.0
+    y_total = 0.0
     start = time.time()
     for step, batch in enumerate(loader, 1):
         if len(batch) == 7:
@@ -186,27 +189,41 @@ def train_one_epoch(
         )
         optimizer.step()
 
+        # Running aggregates (weighted by batch size)
         total += float(loss) * B
+        recon_total += float(recon_loss) * B
+        kl_total += float(kl_loss) * B
+        y_total += float(y_loss) * B
         count += B
         if step % 100 == 0:
+            avg_total = total / max(count, 1)
+            avg_recon = recon_total / max(count, 1)
+            avg_kl = kl_total / max(count, 1)
+            avg_y = y_total / max(count, 1)
+            # Fun, compact status line
             print(
-                f"train step {step}/{len(loader)} avg_loss={total/max(count,1):.6f} elapsed={time.time()-start:.1f}s"
+                f"[🚀 Train] step {step:>4}/{len(loader):<4} | 🎯 total {avg_total:8.5f} "
+                f"= 🧩 recon {recon_weight}×{avg_recon:7.5f} + 🔗 β{kl_beta}×KL {avg_kl:7.5f} + 📈 λ{ret_weight}×NLL {avg_y:7.5f} | ⏱ {time.time()-start:.1f}s"
             )
         if diag_every_steps > 0 and (step % diag_every_steps == 0):
             with torch.no_grad():
                 # Simple z statistic: run encoder again last batch
                 z_std = z_t.std(dim=-1).mean().item()
                 print(
-                    {
-                        "diag": True,
-                        "z_std_mean": z_std,
-                        "recon_loss": float(recon_loss),
-                        "kl": float(kl_loss),
-                        "y_nll": float(y_loss),
-                    }
+                    f"   ↳ [🔎 Diag] z_std_mean={z_std:.4f} | recon={float(recon_loss):.5f} KL={float(kl_loss):.5f} yNLL={float(y_loss):.5f}"
                 )
 
-    return total / max(count, 1)
+    # End-of-epoch summary
+    avg_total = total / max(count, 1)
+    avg_recon = recon_total / max(count, 1)
+    avg_kl = kl_total / max(count, 1)
+    avg_y = y_total / max(count, 1)
+    print(
+        "\n"
+        + f"🏁 [Train Epoch] 🎯 total {avg_total:.6f} | 🧩 recon {recon_weight}×{avg_recon:.6f} | "
+        f"🔗 KL β={kl_beta}, free_nats={kl_free_nats} → {avg_kl:.6f} | 📈 λ={ret_weight}×yNLL {avg_y:.6f}\n"
+    )
+    return avg_total
 
 
 @torch.no_grad()
@@ -218,6 +235,10 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     autocast_dtype: Optional[torch.dtype],
+    kl_free_nats: float,
+    kl_beta: float,
+    ret_weight: float,
+    recon_weight: float = 1.0,
 ) -> float:
     encoder.eval()
     rssm.eval()
@@ -225,6 +246,9 @@ def evaluate(
     head.eval()
     total = 0.0
     count = 0
+    recon_total = 0.0
+    kl_total = 0.0
+    y_total = 0.0
     for batch in loader:
         if len(batch) == 7:
             x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = batch
@@ -266,11 +290,23 @@ def evaluate(
             kl_loss = kl_accum / max(L, 1)
             mu_y, logv_y = head(z_t)
             y_loss = gaussian_nll(y, mu_y, logv_y)
-            loss = recon_loss + kl_loss + 0.3 * y_loss
+            loss = recon_weight * recon_loss + kl_beta * kl_loss + ret_weight * y_loss
 
         total += float(loss) * B
+        recon_total += float(recon_loss) * B
+        kl_total += float(kl_loss) * B
+        y_total += float(y_loss) * B
         count += B
-    return total / max(count, 1)
+
+    avg_total = total / max(count, 1)
+    avg_recon = recon_total / max(count, 1)
+    avg_kl = kl_total / max(count, 1)
+    avg_y = y_total / max(count, 1)
+    print(
+        f"🧪 [Val] 🎯 total {avg_total:.6f} | 🧩 recon {recon_weight}×{avg_recon:.6f} | "
+        f"🔗 KL β={kl_beta}, free_nats={kl_free_nats} → {avg_kl:.6f} | 📈 λ={ret_weight}×yNLL {avg_y:.6f}"
+    )
+    return avg_total
 
 
 def main():
@@ -369,7 +405,17 @@ def main():
             args.diag_every_steps,
         )
         val_loss = evaluate(
-            encoder, rssm, decoder, head, loaders["val"], device, autocast_dtype
+            encoder,
+            rssm,
+            decoder,
+            head,
+            loaders["val"],
+            device,
+            autocast_dtype,
+            args.kl_free_nats,
+            args.kl_beta,
+            args.ret_weight,
+            args.recon_weight,
         )
         scheduler.step()
         log = {
@@ -403,7 +449,17 @@ def main():
         decoder.load_state_dict(ckpt["decoder_state"])  # type: ignore
         head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
     test_loss = evaluate(
-        encoder, rssm, decoder, head, loaders["test"], device, autocast_dtype
+        encoder,
+        rssm,
+        decoder,
+        head,
+        loaders["test"],
+        device,
+        autocast_dtype,
+        args.kl_free_nats,
+        args.kl_beta,
+        args.ret_weight,
+        args.recon_weight,
     )
     print(json.dumps({"test_loss": test_loss}))
 
