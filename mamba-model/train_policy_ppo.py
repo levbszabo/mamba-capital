@@ -201,8 +201,23 @@ def main():
             ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
         return DataLoader(ds, batch_size=args.batch_size, shuffle=True, pin_memory=True)
 
+    def to_eval_loader(split):
+        x_cont = split["x_cont"]
+        x_sym = split["x_symbol_id"]
+        x_hour = split["x_ny_hour_id"]
+        x_dow = split["x_ny_dow_id"]
+        y = split["y"]
+        x_base = split.get("x_base_id")
+        x_quote = split.get("x_quote_id")
+        if x_base is not None and x_quote is not None:
+            ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y)
+        else:
+            ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
+        return DataLoader(ds, batch_size=256, shuffle=False, pin_memory=True)
+
     train_loader = to_loader(train)
     val_loader = to_loader(val)
+    val_eval_loader = to_eval_loader(val)
 
     bp = args.txn_cost_bp * 1e-4
 
@@ -213,6 +228,7 @@ def main():
         logp_buf = []
         rew_buf = []
         val_buf = []
+        entropy_list = []
         for batch in train_loader:
             z = rollout_imagination(encoder, rssm, batch, device)
             # rollout in latent space with policy
@@ -225,6 +241,7 @@ def main():
                 dist = actor(z)
                 a = dist.sample().clamp(-1.0, 1.0)
                 logp = dist.log_prob(a)
+                entropy_list.append(dist.entropy().mean().detach())
                 # reward: head prediction (use first horizon) minus turnover cost
                 # Predict reward proxy using return head if available in checkpoint
                 if ret_head is not None:
@@ -292,6 +309,9 @@ def main():
         idx = torch.randperm(obs_f.size(0))
         nb = cfg.minibatches
         mb_size = obs_f.size(0) // nb
+        clip_fracs = []
+        pi_losses = []
+        v_losses = []
         for _ in range(cfg.train_iters):
             for i in range(nb):
                 j = idx[i * mb_size : (i + 1) * mb_size]
@@ -312,6 +332,14 @@ def main():
                 v_pred = critic(z_j)
                 v_loss = F.mse_loss(v_pred, ret_j)
 
+                # Metrics
+                clipped = (ratio < (1.0 - cfg.clip_ratio)) | (
+                    ratio > (1.0 + cfg.clip_ratio)
+                )
+                clip_fracs.append(float(clipped.float().mean().cpu()))
+                pi_losses.append(float(pi_loss.detach().cpu()))
+                v_losses.append(float(v_loss.detach().cpu()))
+
                 opt_pi.zero_grad(set_to_none=True)
                 pi_loss.backward()
                 opt_pi.step()
@@ -320,8 +348,92 @@ def main():
                 v_loss.backward()
                 opt_vf.step()
 
-        # Quick validation PnL using head sign policy
-        # Optionally: add validation PnL here using saved return head from world model
+        # Training collection metrics
+        avg_rew = float(rew.mean().cpu())
+        avg_abs_a = float(act.abs().mean().cpu())
+        # Turnover per trajectory
+        da = act[:, 1:, :] - act[:, :-1, :]
+        avg_turnover = float(da.abs().mean().cpu())
+        ent_mean = (
+            float(torch.stack(entropy_list).mean().cpu()) if entropy_list else 0.0
+        )
+        print(
+            {
+                "epoch": epoch,
+                "train_samples": int(B * T),
+                "avg_reward": avg_rew,
+                "avg_action_abs": avg_abs_a,
+                "avg_turnover": avg_turnover,
+                "pi_loss": float(np.mean(pi_losses)) if pi_losses else 0.0,
+                "v_loss": float(np.mean(v_losses)) if v_losses else 0.0,
+                "clip_frac": float(np.mean(clip_fracs)) if clip_fracs else 0.0,
+                "entropy": ent_mean,
+            }
+        )
+
+        # Validation: actor vs baseline (sign(mu)) on real windows (first horizon)
+        with torch.no_grad():
+            # Build sequences in dataset order
+            actor_pos = []
+            base_pos = []
+            y_true = []
+            for xb in val_eval_loader:
+                if len(xb) == 7:
+                    x_cont, x_sym, x_hour, x_dow, x_base, x_quote, yb = [
+                        t.to(device) for t in xb
+                    ]
+                else:
+                    x_cont, x_sym, x_hour, x_dow, yb = [t.to(device) for t in xb]
+                    x_base = None
+                    x_quote = None
+                E = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
+                Bv, Lv, _ = E.shape
+                h_v = torch.zeros(Bv, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
+                z_v = None
+                for t in range(Lv):
+                    mu_p, logv_p = rssm.prior(h_v)
+                    mu_q, logv_q = rssm.posterior(h_v, E[:, t, :])
+                    z_v = mu_q
+                    h_v = rssm.core(z_v, h_v, None)
+                assert z_v is not None
+                dist_eval = actor(z_v)
+                a_mean = dist_eval.mean.squeeze(-1)
+                actor_pos.append(a_mean.cpu())
+                if ret_head is not None:
+                    mu_eval, _ = ret_head(z_v)
+                    base_pos.append(torch.sign(mu_eval[:, 0]).cpu())
+                y_true.append(yb[:, 0].cpu())
+            actor_pos = torch.cat(actor_pos).numpy()
+            y_true = torch.cat(y_true).numpy()
+            # Costs-aware PnL for actor
+            cost = np.abs(np.diff(actor_pos, prepend=0)) * (args.txn_cost_bp * 1e-4)
+            pnl = actor_pos * y_true - cost
+            equity = np.cumsum(pnl)
+            print(
+                {
+                    "epoch": epoch,
+                    "actor_sharpe": sharpe_ratio(pnl),
+                    "actor_mdd": max_drawdown(equity),
+                    "actor_final_equity": float(equity[-1]) if len(equity) else 0.0,
+                }
+            )
+            if ret_head is not None:
+                base_pos = torch.cat(base_pos).numpy()
+                base_cost = np.abs(np.diff(base_pos, prepend=0)) * (
+                    args.txn_cost_bp * 1e-4
+                )
+                base_pnl = base_pos * y_true - base_cost
+                base_equity = np.cumsum(base_pnl)
+                print(
+                    {
+                        "epoch": epoch,
+                        "baseline_sign_mu_sharpe": sharpe_ratio(base_pnl),
+                        "baseline_sign_mu_mdd": max_drawdown(base_equity),
+                        "baseline_sign_mu_final_equity": (
+                            float(base_equity[-1]) if len(base_equity) else 0.0
+                        ),
+                    }
+                )
 
 
 if __name__ == "__main__":
