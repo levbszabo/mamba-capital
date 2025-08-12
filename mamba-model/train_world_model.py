@@ -235,33 +235,39 @@ def train_one_epoch(
                 mu_h = mu_y[:, 0]
                 y_h = y[:, 0]
                 sig_h = torch.exp(0.5 * logv_y[:, 0]).clamp_min(1e-8)
-                z = mu_h / sig_h
+                # Ensure float32 for stats (quantile doesn't support bf16)
+                mu_h_f = mu_h.float()
+                y_h_f = y_h.float()
+                sig_h_f = sig_h.float()
+                z = mu_h_f / sig_h_f
                 # Pearson IC
-                if mu_h.std() > 0 and y_h.std() > 0:
+                if mu_h_f.std() > 0 and y_h_f.std() > 0:
                     ic = float(
-                        torch.corrcoef(torch.stack([mu_h, y_h]))[0, 1].clamp(-1, 1)
+                        torch.corrcoef(torch.stack([mu_h_f, y_h_f]))[0, 1].clamp(-1, 1)
                     )
                 else:
                     ic = 0.0
                 # Spearman via ranks
-                r_mu = torch.argsort(torch.argsort(mu_h))
-                r_y = torch.argsort(torch.argsort(y_h))
+                r_mu = torch.argsort(torch.argsort(mu_h_f))
+                r_y = torch.argsort(torch.argsort(y_h_f))
                 if r_mu.float().std() > 0 and r_y.float().std() > 0:
                     ic_s = float(
                         torch.corrcoef(torch.stack([r_mu.float(), r_y.float()]))[0, 1]
                     )
                 else:
                     ic_s = 0.0
-                diracc = float((torch.sign(mu_h) == torch.sign(y_h)).float().mean())
-                edge = float((torch.sign(mu_h) * y_h).mean())
+                diracc = float((torch.sign(mu_h_f) == torch.sign(y_h_f)).float().mean())
+                edge = float((torch.sign(mu_h_f) * y_h_f).mean())
                 # Top-20% by |z|
-                thr = torch.quantile(z.abs(), 0.8)
+                thr = torch.quantile(z.abs().float(), 0.8)
                 mask = z.abs() >= thr
                 if mask.any():
                     diracc_top = float(
-                        (torch.sign(mu_h[mask]) == torch.sign(y_h[mask])).float().mean()
+                        (torch.sign(mu_h_f[mask]) == torch.sign(y_h_f[mask]))
+                        .float()
+                        .mean()
                     )
-                    edge_top = float((torch.sign(mu_h[mask]) * y_h[mask]).mean())
+                    edge_top = float((torch.sign(mu_h_f[mask]) * y_h_f[mask]).mean())
                 else:
                     diracc_top = float("nan")
                     edge_top = float("nan")
