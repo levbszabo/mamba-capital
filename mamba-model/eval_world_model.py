@@ -69,7 +69,12 @@ def main():
     x_hour = tensors["x_ny_hour_id"]
     x_dow = tensors["x_ny_dow_id"]
     y = tensors["y"]
-    ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
+    x_base = tensors.get("x_base_id")
+    x_quote = tensors.get("x_quote_id")
+    if x_base is not None and x_quote is not None:
+        ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y)
+    else:
+        ds = TensorDataset(x_cont, x_sym, x_hour, x_dow, y)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, pin_memory=True)
 
     # Rebuild model
@@ -104,8 +109,13 @@ def main():
     MU_list: List[torch.Tensor] = []
     SIG_list: List[torch.Tensor] = []
     for xb in loader:
-        xc, xs, xh, xd, yb = [t.to(device) for t in xb]
-        E = encoder(xc, xs, xh, xd, None, None)
+        if len(xb) == 7:
+            xc, xs, xh, xd, xb_id, xq_id, yb = [t.to(device) for t in xb]
+        else:
+            xc, xs, xh, xd, yb = [t.to(device) for t in xb]
+            xb_id = None
+            xq_id = None
+        E = encoder(xc, xs, xh, xd, xb_id, xq_id)
         B, L, _ = E.shape
         h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
         z_t = None
