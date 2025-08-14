@@ -91,6 +91,8 @@ def parse_args():
     p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--kl_beta", type=float, default=1.0)
+    p.add_argument("--kl_beta_start", type=float, default=0.1)
+    p.add_argument("--kl_warmup_epochs", type=int, default=5)
     p.add_argument("--kl_free_nats", type=float, default=2.0)
     p.add_argument("--recon_weight", type=float, default=1.0)
     p.add_argument("--ret_weight", type=float, default=0.3)
@@ -189,8 +191,11 @@ def train_one_epoch(
                 mu_q, logv_q = rssm.posterior(h, E[:, t, :])
                 z_t = rssm._rsample(mu_q, logv_q)
                 h = rssm.core(z_t, h, None)
-                mu_x, logv_x = decoder(z_t)
-                recon_loss = recon_loss + gaussian_nll(x_cont[:, t, :], mu_x, logv_x)
+                if recon_weight > 0.0:
+                    mu_x, logv_x = decoder(z_t)
+                    recon_loss = recon_loss + gaussian_nll(
+                        x_cont[:, t, :], mu_x, logv_x
+                    )
                 kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
                 kl_accum = kl_accum + apply_free_nats(kl_t, kl_free_nats)
 
@@ -361,10 +366,13 @@ def evaluate(
                 mu_q, logv_q = rssm.posterior(h, E[:, t, :])
                 z_t = mu_q  # use mean at eval
                 h = rssm.core(z_t, h, None)
-                mu_x, logv_x = decoder(z_t)
-                recon_loss = recon_loss + gaussian_nll(x_cont[:, t, :], mu_x, logv_x)
+                if recon_weight > 0.0:
+                    mu_x, logv_x = decoder(z_t)
+                    recon_loss = recon_loss + gaussian_nll(
+                        x_cont[:, t, :], mu_x, logv_x
+                    )
                 kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
-                kl_accum = kl_accum + apply_free_nats(kl_t, 2.0)
+                kl_accum = kl_accum + apply_free_nats(kl_t, kl_free_nats)
 
             recon_loss = recon_loss / max(L, 1)
             kl_loss = kl_accum / max(L, 1)
@@ -569,6 +577,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
         t0 = time.time()
+        # KL warm-up schedule
+        beta_start = float(args.kl_beta_start)
+        warm_epochs = max(1, int(args.kl_warmup_epochs))
+        progress = min((epoch - 1) / float(warm_epochs), 1.0)
+        kl_beta_epoch = beta_start + (float(args.kl_beta) - beta_start) * progress
         train_loss = train_one_epoch(
             encoder,
             rssm,
@@ -578,7 +591,7 @@ def main():
             device,
             autocast_dtype,
             optimizer,
-            args.kl_beta,
+            kl_beta_epoch,
             args.kl_free_nats,
             args.recon_weight,
             args.ret_weight,
@@ -593,7 +606,7 @@ def main():
             device,
             autocast_dtype,
             args.kl_free_nats,
-            args.kl_beta,
+            kl_beta_epoch,
             args.ret_weight,
             args.recon_weight,
         )
@@ -650,7 +663,7 @@ def main():
         device,
         autocast_dtype,
         args.kl_free_nats,
-        args.kl_beta,
+        float(args.kl_beta),
         args.ret_weight,
         args.recon_weight,
     )
