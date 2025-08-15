@@ -107,15 +107,43 @@ def run_backtest(
                 "price_dir must be provided when recompute_y_from_prices=True"
             )
         price_rows = []
-        for p in Path(price_dir).glob(price_glob):
+        matched_files = list(Path(price_dir).glob(price_glob))
+        if not matched_files:
+            raise RuntimeError(
+                f"No files matched: dir={price_dir} glob='{price_glob}'."
+            )
+        for p in matched_files:
             try:
                 pf = pd.read_csv(p)
             except Exception:
                 continue
-            if price_ts_col not in pf.columns or price_sym_col not in pf.columns:
+            # Column fallback mapping
+            ts_col = (
+                price_ts_col
+                if price_ts_col in pf.columns
+                else (
+                    "ts_utc"
+                    if "ts_utc" in pf.columns
+                    else (
+                        "date"
+                        if "date" in pf.columns
+                        else ("timestamp" if "timestamp" in pf.columns else None)
+                    )
+                )
+            )
+            sym_col = (
+                price_sym_col
+                if price_sym_col in pf.columns
+                else (
+                    "symbol"
+                    if "symbol" in pf.columns
+                    else ("pair" if "pair" in pf.columns else None)
+                )
+            )
+            if ts_col is None or sym_col is None:
                 continue
             pf = pf[
-                [price_sym_col, price_ts_col]
+                [sym_col, ts_col]
                 + ([price_close_col] if price_close_col in pf.columns else [])
                 + (
                     [price_ret_col]
@@ -123,9 +151,7 @@ def run_backtest(
                     else []
                 )
             ].copy()
-            pf.rename(
-                columns={price_sym_col: "symbol", price_ts_col: "ts_utc"}, inplace=True
-            )
+            pf.rename(columns={sym_col: "symbol", ts_col: "ts_utc"}, inplace=True)
             pf["ts_utc"] = pd.to_datetime(pf["ts_utc"], errors="coerce")
             pf.sort_values(["symbol", "ts_utc"], inplace=True)
             if price_ret_col and price_ret_col in pf.columns:
@@ -139,7 +165,9 @@ def run_backtest(
                 pf["y_price"] = np.log(pf["close_fwd"] / pf["close"])  # log-return
             price_rows.append(pf[["symbol", "ts_utc", "y_price"]])
         if not price_rows:
-            raise RuntimeError("No price files loaded for recompute_y_from_prices")
+            raise RuntimeError(
+                "No usable price files after parsing (check column names: symbol/date/ts_utc, close)."
+            )
         prices = pd.concat(price_rows, axis=0, ignore_index=True)
         # Join onto df (requires ts_utc present)
         if df["ts_utc"].isna().any():
