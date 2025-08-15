@@ -64,6 +64,11 @@ def main():
         default="",
         help="Optional path to save per-sample forecasts with confidence",
     )
+    p.add_argument(
+        "--require_samples_meta",
+        action="store_true",
+        help="Fail if meta['samples'][split] is missing (to ensure ts_utc export)",
+    )
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,7 +147,12 @@ def main():
     MU_list: List[torch.Tensor] = []
     SIG_list: List[torch.Tensor] = []
     rows = []
-    samples = meta.get("samples", {}).get(args.split, [])
+    samples_root = meta.get("samples", {})
+    samples = samples_root.get(args.split, [])
+    if args.save_csv and args.require_samples_meta and not samples:
+        raise RuntimeError(
+            "meta['samples'][split] missing; cannot export ts_utc/symbol-aligned CSV. Re-run data build to include samples metadata."
+        )
     idx2sym = meta.get("idx2symbol") or meta.get("vocab", {}).get("idx2symbol")
     i0 = 0
     for xb in loader:
@@ -172,7 +182,7 @@ def main():
         MU_list.append(mu_y.cpu())
         SIG_list.append(torch.exp(0.5 * logv_y).cpu())
 
-        # Optional per-row export
+        # Optional per-row export (preserve original dataset info)
         if args.save_csv:
             mu_np = mu_y.detach().cpu().numpy()
             sig_np = np.exp(0.5 * logv_y.detach().cpu().numpy())
@@ -190,7 +200,15 @@ def main():
                     or meta_j.get("t_end")
                     or meta_j.get("timestamp")
                 )
-                row = {"idx": j, "symbol": sym, "ts_utc": ts}
+                # Include original dataset fields when available to maintain provenance
+                row = {
+                    "idx": j,
+                    "symbol": sym,
+                    "ts_utc": ts,
+                }
+                for k, v in meta_j.items():
+                    if k not in row and isinstance(v, (int, float, str)):
+                        row[k] = v
                 for h_idx, h in enumerate(horizons):
                     m = float(mu_np[b, h_idx])
                     s = float(sig_np[b, h_idx])
@@ -244,6 +262,13 @@ def main():
             else float("nan")
         )
         print({"h": h, "diracc@20": diracc20, "edge": edge, "edge@20": edge20})
+
+        # If realized returns not present in CSV export, optionally include them now
+        if args.save_csv and rows and (f"y_{h}h" not in rows[0]):
+            # Append realized returns for this horizon into each row (aligned order)
+            y_col = Y[:, h_idx]
+            for i in range(len(rows)):
+                rows[i][f"y_{h}h"] = float(y_col[i])
         for pct in [10, 20, 30, 40, 50]:
             thr = np.percentile(score, 100 - pct)
             mask = score >= thr
