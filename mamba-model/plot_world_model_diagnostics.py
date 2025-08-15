@@ -90,11 +90,16 @@ def collect_split_arrays(
         B, L, _ = E.shape
         h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
         z_t = None
-        for t in range(L):
-            mu_p, logv_p = rssm.prior(h)
-            mu_q, logv_q = rssm.posterior(h, E[:, t, :])
-            z_t = mu_q
-            h = rssm.core(z_t, h, None)
+        if hasattr(rssm.cfg, "stochastic") and not rssm.cfg.stochastic:
+            for t in range(L):
+                z_t = E[:, t, :]
+                h = rssm.core(z_t, h, None)
+        else:
+            for t in range(L):
+                mu_p, logv_p = rssm.prior(h)
+                mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+                z_t = mu_q
+                h = rssm.core(z_t, h, None)
         assert z_t is not None
         mu_y, logv_y = head(z_t)
         Zs.append(z_t.detach().cpu())
@@ -141,6 +146,11 @@ def main():
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--max_points", type=int, default=50000)
     ap.add_argument("--txn_cost_bp", type=float, default=0.5)
+    ap.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use deterministic dynamics for diagnostics",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -171,7 +181,11 @@ def main():
         dropout=0.1,
     ).to(device)
     rssm = RSSM(
-        RSSMConfig(latent_dim=latent_dim, hidden_dim=hidden_dim, stochastic=True)
+        RSSMConfig(
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            stochastic=(not args.deterministic),
+        )
     ).to(device)
     decoder = ObsDecoder(
         latent_dim=latent_dim, num_cont_features=len(feature_names)

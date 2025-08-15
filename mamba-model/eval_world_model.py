@@ -53,6 +53,17 @@ def main():
         "--use_zscore", action="store_true", help="Use |mu/sigma| for thresholding"
     )
     p.add_argument("--txn_cost_bp", type=float, default=0.5)
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Evaluate using deterministic dynamics (no KL, no sampling)",
+    )
+    p.add_argument(
+        "--save_csv",
+        type=str,
+        default="",
+        help="Optional path to save per-sample forecasts with confidence",
+    )
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -97,7 +108,11 @@ def main():
         dropout=0.1,
     ).to(device)
     rssm = RSSM(
-        RSSMConfig(latent_dim=latent_dim, hidden_dim=hidden_dim, stochastic=True)
+        RSSMConfig(
+            latent_dim=latent_dim,
+            hidden_dim=hidden_dim,
+            stochastic=(not args.deterministic),
+        )
     ).to(device)
     decoder = ObsDecoder(
         latent_dim=latent_dim, num_cont_features=len(feature_names)
@@ -117,6 +132,10 @@ def main():
     Y_list: List[torch.Tensor] = []
     MU_list: List[torch.Tensor] = []
     SIG_list: List[torch.Tensor] = []
+    rows = []
+    samples = meta.get("samples", {}).get(args.split, [])
+    idx2sym = meta.get("idx2symbol") or meta.get("vocab", {}).get("idx2symbol")
+    i0 = 0
     for xb in loader:
         if len(xb) == 7:
             xc, xs, xh, xd, xb_id, xq_id, yb = [t.to(device) for t in xb]
@@ -128,16 +147,49 @@ def main():
         B, L, _ = E.shape
         h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
         z_t = None
-        for t in range(L):
-            mu_p, logv_p = rssm.prior(h)
-            mu_q, logv_q = rssm.posterior(h, E[:, t, :])
-            z_t = mu_q  # mean
-            h = rssm.core(z_t, h, None)
+        if args.deterministic:
+            for t in range(L):
+                z_t = E[:, t, :]
+                h = rssm.core(z_t, h, None)
+        else:
+            for t in range(L):
+                mu_p, logv_p = rssm.prior(h)
+                mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+                z_t = mu_q  # mean
+                h = rssm.core(z_t, h, None)
         assert z_t is not None
         mu_y, logv_y = head(z_t)
         Y_list.append(yb)
         MU_list.append(mu_y.cpu())
         SIG_list.append(torch.exp(0.5 * logv_y).cpu())
+
+        # Optional per-row export
+        if args.save_csv:
+            mu_np = mu_y.detach().cpu().numpy()
+            sig_np = np.exp(0.5 * logv_y.detach().cpu().numpy())
+            for b in range(B):
+                j = i0 + b
+                meta_j = samples[j] if j < len(samples) else {}
+                sym_id = int(xs[b, 0].detach().cpu())
+                sym = (
+                    idx2sym[sym_id]
+                    if isinstance(idx2sym, list) and sym_id < len(idx2sym)
+                    else meta_j.get("symbol", sym_id)
+                )
+                ts = (
+                    meta_j.get("ts_utc")
+                    or meta_j.get("t_end")
+                    or meta_j.get("timestamp")
+                )
+                row = {"idx": j, "symbol": sym, "ts_utc": ts}
+                for h_idx, h in enumerate(horizons):
+                    m = float(mu_np[b, h_idx])
+                    s = float(sig_np[b, h_idx])
+                    row[f"mu_{h}h"] = m
+                    row[f"sig_{h}h"] = s
+                    row[f"z_{h}h"] = m / max(s, 1e-8)
+                rows.append(row)
+        i0 += B
 
     Y = torch.cat(Y_list, dim=0).cpu().numpy()
     MU = torch.cat(MU_list, dim=0).cpu().numpy()
@@ -169,6 +221,20 @@ def main():
 
         # Threshold buckets
         score = np.abs(mu / np.maximum(sig, 1e-6)) if args.use_zscore else np.abs(mu)
+        thr20 = np.percentile(score, 80)
+        mask20 = score >= thr20
+        diracc20 = (
+            float(np.mean(np.sign(mu[mask20]) == np.sign(yt[mask20])))
+            if mask20.any()
+            else float("nan")
+        )
+        edge = float(np.mean(np.sign(mu) * yt))
+        edge20 = (
+            float(np.mean(np.sign(mu[mask20]) * yt[mask20]))
+            if mask20.any()
+            else float("nan")
+        )
+        print({"h": h, "diracc@20": diracc20, "edge": edge, "edge@20": edge20})
         for pct in [10, 20, 30, 40, 50]:
             thr = np.percentile(score, 100 - pct)
             mask = score >= thr
@@ -186,7 +252,14 @@ def main():
                     "avg_realized_ret": avg_ret,
                 }
             )
+    # Optional CSV
+    if args.save_csv and rows:
+        import pandas as pd
 
+        df = pd.DataFrame(rows)
+        Path(args.save_csv).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(args.save_csv, index=False)
+        print(f"Saved per-sample forecasts to {args.save_csv} ({len(df)} rows)")
         # Simple PnL with costs
         pos = np.sign(mu)
         ret = pos * yt
