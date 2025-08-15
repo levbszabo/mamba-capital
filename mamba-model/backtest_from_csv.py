@@ -65,6 +65,16 @@ def sharpe_ratio(x: np.ndarray, eps: float = 1e-12) -> float:
     return float(np.mean(x) / (np.std(x) + eps))
 
 
+def _find_existing_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    """Return existing column name matching any candidate (case/space-insensitive)."""
+    norm = {c.strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.strip().lower()
+        if key in norm:
+            return norm[key]
+    return None
+
+
 def run_backtest(
     csv_path: Path,
     out_dir: Path,
@@ -88,11 +98,10 @@ def run_backtest(
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
     # Parse timestamp; tolerate missing by creating an index if needed
-    # In eval CSVs we may have ts_utc or ts_end. Prefer ts_utc; fall back to ts_end.
-    if "ts_utc" in df.columns:
-        df["ts_utc"] = pd.to_datetime(df["ts_utc"], errors="coerce")
-    elif "ts_end" in df.columns:
-        df["ts_utc"] = pd.to_datetime(df["ts_end"], errors="coerce")
+    # In eval CSVs we may have ts_utc or ts_end (names may vary in case/spaces).
+    ts_eval_col = _find_existing_col(df, ["ts_utc", "ts_end", "timestamp", "date"])
+    if ts_eval_col is not None:
+        df["ts_utc"] = pd.to_datetime(df[ts_eval_col], errors="coerce")
     else:
         df["ts_utc"] = pd.NaT
     # Required columns for selected horizon
