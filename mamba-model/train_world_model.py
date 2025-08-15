@@ -105,6 +105,11 @@ def parse_args():
         default="bf16" if torch.cuda.is_available() else "fp32",
     )
     p.add_argument("--diag_every_steps", type=int, default=500)
+    p.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use deterministic dynamics (no KL, no sampling; z_t = encoder output)",
+    )
     # Validation metrics printing
     p.add_argument(
         "--val_metrics_every_epochs",
@@ -146,6 +151,7 @@ def train_one_epoch(
     recon_weight: float,
     ret_weight: float,
     diag_every_steps: int,
+    deterministic: bool,
 ) -> float:
     encoder.train()
     rssm.train()
@@ -186,21 +192,27 @@ def train_one_epoch(
             recon_loss = torch.tensor(0.0, device=device, dtype=E.dtype)
             kl_accum = torch.tensor(0.0, device=device, dtype=E.dtype)
 
-            for t in range(L):
-                mu_p, logv_p = rssm.prior(h)
-                mu_q, logv_q = rssm.posterior(h, E[:, t, :])
-                z_t = rssm._rsample(mu_q, logv_q)
-                h = rssm.core(z_t, h, None)
-                if recon_weight > 0.0:
-                    mu_x, logv_x = decoder(z_t)
-                    recon_loss = recon_loss + gaussian_nll(
-                        x_cont[:, t, :], mu_x, logv_x
-                    )
-                kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
-                kl_accum = kl_accum + apply_free_nats(kl_t, kl_free_nats)
+            if deterministic:
+                for t in range(L):
+                    z_t = E[:, t, :]
+                    h = rssm.core(z_t, h, None)
+                kl_loss = torch.tensor(0.0, device=device, dtype=E.dtype)
+            else:
+                for t in range(L):
+                    mu_p, logv_p = rssm.prior(h)
+                    mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+                    z_t = rssm._rsample(mu_q, logv_q)
+                    h = rssm.core(z_t, h, None)
+                    if recon_weight > 0.0:
+                        mu_x, logv_x = decoder(z_t)
+                        recon_loss = recon_loss + gaussian_nll(
+                            x_cont[:, t, :], mu_x, logv_x
+                        )
+                    kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
+                    kl_accum = kl_accum + apply_free_nats(kl_t, kl_free_nats)
+                kl_loss = kl_accum / max(L, 1)
 
             recon_loss = recon_loss / max(L, 1)
-            kl_loss = kl_accum / max(L, 1)
             # Return head on last latent h state: need last z_t; reuse mu_q of last step's sample
             # For numerical stability, feed last latent derived from last posterior sample
             mu_y, logv_y = head(z_t)
@@ -208,7 +220,11 @@ def train_one_epoch(
             logv_y = logv_y.clamp(min=-6.0, max=2.0)
             y_loss = gaussian_nll(y, mu_y, logv_y) + 1e-6 * (logv_y**2).mean()
 
-            loss = recon_weight * recon_loss + kl_beta * kl_loss + ret_weight * y_loss
+            loss = (
+                recon_weight * recon_loss
+                + (0.0 if deterministic else kl_beta * kl_loss)
+                + ret_weight * y_loss
+            )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -324,6 +340,7 @@ def evaluate(
     kl_beta: float,
     ret_weight: float,
     recon_weight: float = 1.0,
+    deterministic: bool = False,
 ) -> float:
     encoder.eval()
     rssm.eval()
@@ -361,24 +378,34 @@ def evaluate(
             h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
             recon_loss = torch.tensor(0.0, device=device, dtype=E.dtype)
             kl_accum = torch.tensor(0.0, device=device, dtype=E.dtype)
-            for t in range(L):
-                mu_p, logv_p = rssm.prior(h)
-                mu_q, logv_q = rssm.posterior(h, E[:, t, :])
-                z_t = mu_q  # use mean at eval
-                h = rssm.core(z_t, h, None)
-                if recon_weight > 0.0:
-                    mu_x, logv_x = decoder(z_t)
-                    recon_loss = recon_loss + gaussian_nll(
-                        x_cont[:, t, :], mu_x, logv_x
-                    )
-                kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
-                kl_accum = kl_accum + apply_free_nats(kl_t, kl_free_nats)
+            if deterministic:
+                for t in range(L):
+                    z_t = E[:, t, :]
+                    h = rssm.core(z_t, h, None)
+                kl_loss = torch.tensor(0.0, device=device, dtype=E.dtype)
+            else:
+                for t in range(L):
+                    mu_p, logv_p = rssm.prior(h)
+                    mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+                    z_t = mu_q  # use mean at eval
+                    h = rssm.core(z_t, h, None)
+                    if recon_weight > 0.0:
+                        mu_x, logv_x = decoder(z_t)
+                        recon_loss = recon_loss + gaussian_nll(
+                            x_cont[:, t, :], mu_x, logv_x
+                        )
+                    kl_t = rssm.kl_gaussian(mu_q, logv_q, mu_p, logv_p)
+                    kl_accum = kl_accum + apply_free_nats(kl_t, kl_free_nats)
+                kl_loss = kl_accum / max(L, 1)
 
             recon_loss = recon_loss / max(L, 1)
-            kl_loss = kl_accum / max(L, 1)
             mu_y, logv_y = head(z_t)
             y_loss = gaussian_nll(y, mu_y, logv_y)
-            loss = recon_weight * recon_loss + kl_beta * kl_loss + ret_weight * y_loss
+            loss = (
+                recon_weight * recon_loss
+                + ((0.0 if deterministic else kl_beta * kl_loss))
+                + ret_weight * y_loss
+            )
 
         total += float(loss) * B
         recon_total += float(recon_loss) * B
@@ -440,10 +467,15 @@ def quick_val_metrics(
         h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
         z_t = None
         for t in range(L):
-            mu_p, logv_p = rssm.prior(h)
-            mu_q, logv_q = rssm.posterior(h, E[:, t, :])
-            z_t = mu_q
-            h = rssm.core(z_t, h, None)
+            # Use deterministic path if model is deterministic
+            if hasattr(rssm.cfg, "stochastic") and not rssm.cfg.stochastic:
+                z_t = E[:, t, :]
+                h = rssm.core(z_t, h, None)
+            else:
+                mu_p, logv_p = rssm.prior(h)
+                mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+                z_t = mu_q
+                h = rssm.core(z_t, h, None)
         assert z_t is not None
         mu_y, logv_y = head(z_t)
         MU_list.append(mu_y.detach().cpu())
@@ -545,7 +577,9 @@ def main():
     ).to(device)
     rssm = RSSM(
         RSSMConfig(
-            latent_dim=cfg.latent_dim, hidden_dim=cfg.hidden_dim, stochastic=True
+            latent_dim=cfg.latent_dim,
+            hidden_dim=cfg.hidden_dim,
+            stochastic=not args.deterministic,
         )
     ).to(device)
     decoder = ObsDecoder(
@@ -596,6 +630,7 @@ def main():
             args.recon_weight,
             args.ret_weight,
             args.diag_every_steps,
+            args.deterministic,
         )
         val_loss = evaluate(
             encoder,
@@ -609,6 +644,7 @@ def main():
             kl_beta_epoch,
             args.ret_weight,
             args.recon_weight,
+            args.deterministic,
         )
         if args.val_metrics_every_epochs and (
             epoch % args.val_metrics_every_epochs == 0
@@ -666,6 +702,7 @@ def main():
         float(args.kl_beta),
         args.ret_weight,
         args.recon_weight,
+        args.deterministic,
     )
     print(json.dumps({"test_loss": test_loss}))
 
