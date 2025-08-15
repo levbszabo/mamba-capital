@@ -91,6 +91,14 @@ def main():
     # Load checkpoint to get architecture dims
     ckpt = torch.load(Path(args.checkpoint), map_location=device)
     cfg = ckpt.get("cfg", {})
+    # Auto-detect deterministic RSSM from checkpoint if user didn't specify
+    try:
+        rssm_state = ckpt.get("rssm_state", {})
+        is_det_ckpt = any(k.startswith("out_proj.") for k in rssm_state.keys())
+        if is_det_ckpt:
+            args.deterministic = True
+    except Exception:
+        pass
     latent_dim = int(cfg.get("latent_dim", 64))
     hidden_dim = int(cfg.get("hidden_dim", 256))
 
@@ -120,7 +128,8 @@ def main():
     head = ReturnHead(latent_dim=latent_dim, num_horizons=num_horizons).to(device)
 
     encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
-    rssm.load_state_dict(ckpt["rssm_state"])  # type: ignore
+    # Allow partial load when switching between stochastic/deterministic RSSM
+    rssm.load_state_dict(ckpt["rssm_state"], strict=False)  # type: ignore
     decoder.load_state_dict(ckpt["decoder_state"])  # type: ignore
     head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
     encoder.eval()
