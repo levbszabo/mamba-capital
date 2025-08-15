@@ -75,6 +75,15 @@ def run_backtest(
     k: float,
     cost_bp: float,
     calib: Calibration,
+    stride: int = 0,
+    recompute_y_from_prices: bool = False,
+    price_dir: Optional[Path] = None,
+    price_glob: str = "*.csv",
+    price_ts_col: str = "ts_utc",
+    price_sym_col: str = "symbol",
+    price_close_col: str = "close",
+    price_ret_col: str = "",
+    overlap_scale: bool = False,
 ) -> Dict[str, float]:
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
@@ -91,6 +100,56 @@ def run_backtest(
     for c in ["symbol", mu_col, sig_col, z_col, y_col]:
         if c not in df.columns:
             raise ValueError(f"CSV missing required column: {c}")
+    # Optionally recompute realized returns from source price files
+    if recompute_y_from_prices:
+        if price_dir is None:
+            raise ValueError(
+                "price_dir must be provided when recompute_y_from_prices=True"
+            )
+        price_rows = []
+        for p in Path(price_dir).glob(price_glob):
+            try:
+                pf = pd.read_csv(p)
+            except Exception:
+                continue
+            if price_ts_col not in pf.columns or price_sym_col not in pf.columns:
+                continue
+            pf = pf[
+                [price_sym_col, price_ts_col]
+                + ([price_close_col] if price_close_col in pf.columns else [])
+                + (
+                    [price_ret_col]
+                    if price_ret_col and price_ret_col in pf.columns
+                    else []
+                )
+            ].copy()
+            pf.rename(
+                columns={price_sym_col: "symbol", price_ts_col: "ts_utc"}, inplace=True
+            )
+            pf["ts_utc"] = pd.to_datetime(pf["ts_utc"], errors="coerce")
+            pf.sort_values(["symbol", "ts_utc"], inplace=True)
+            if price_ret_col and price_ret_col in pf.columns:
+                pf["y_price"] = pf[price_ret_col]
+            else:
+                if price_close_col not in pf.columns:
+                    continue
+                # Future log return over horizon H
+                pf["close"] = pf[price_close_col].astype(float)
+                pf["close_fwd"] = pf.groupby("symbol")["close"].shift(-horizon)
+                pf["y_price"] = np.log(pf["close_fwd"] / pf["close"])  # log-return
+            price_rows.append(pf[["symbol", "ts_utc", "y_price"]])
+        if not price_rows:
+            raise RuntimeError("No price files loaded for recompute_y_from_prices")
+        prices = pd.concat(price_rows, axis=0, ignore_index=True)
+        # Join onto df (requires ts_utc present)
+        if df["ts_utc"].isna().any():
+            raise RuntimeError(
+                "ts_utc missing in eval CSV; cannot join prices. Re-export with --require_samples_meta."
+            )
+        df = df.merge(prices, on=["symbol", "ts_utc"], how="left")
+        # Overwrite y with price-based
+        df[y_col] = df["y_price"]
+
     # Drop rows lacking outcomes
     df = df.dropna(subset=[mu_col, sig_col, y_col])
     # Apply calibration
@@ -123,7 +182,12 @@ def run_backtest(
 
     pnl_list = []
     dates = []
-    for ts, g in df.groupby(ts_key):
+    # Apply stride over timestamps to avoid overlapping targets double-counting
+    grouped = list(df.groupby(ts_key))
+    if stride and stride > 0:
+        grouped = [grp for idx, grp in enumerate(grouped) if (idx % stride) == 0]
+
+    for ts, g in grouped:
         # Select set
         z = g["z_hat"].to_numpy()
         mu = g["mu_hat"].to_numpy()
@@ -153,7 +217,13 @@ def run_backtest(
             pnl += p_now * float(y[i])
             txn += abs(p_now - p_prev)
             pos_prev[s] = p_now
-        pnl_net = pnl - txn * cost
+        # Overlap scale to avoid overcounting when trading every bar on H-hour labels
+        scale = (
+            (1.0 / max(horizon, 1))
+            if (overlap_scale and (not stride or stride <= 1))
+            else 1.0
+        )
+        pnl_net = (pnl * scale) - (txn * cost * scale)
         pnl_list.append(pnl_net)
         dates.append(ts)
         eq[ts] = pnl_net
@@ -240,6 +310,38 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--a", type=float, default=0.0)
     p.add_argument("--b", type=float, default=1.0)
     p.add_argument("--s", type=float, default=1.0)
+    p.add_argument(
+        "--stride",
+        type=int,
+        default=0,
+        help="Trade every Nth timestamp to avoid overlapping horizons (e.g., 6 or 24)",
+    )
+    p.add_argument(
+        "--overlap_scale",
+        action="store_true",
+        help="Scale PnL by 1/horizon if trading every bar on H-hour labels",
+    )
+    p.add_argument(
+        "--recompute_y",
+        action="store_true",
+        help="Recompute realized returns from source price files and overwrite y_{h}h",
+    )
+    p.add_argument(
+        "--price_dir",
+        type=str,
+        default="",
+        help="Directory of per-asset price CSVs to join (must include symbol and ts_utc)",
+    )
+    p.add_argument("--price_glob", type=str, default="*.csv")
+    p.add_argument("--price_ts_col", type=str, default="ts_utc")
+    p.add_argument("--price_sym_col", type=str, default="symbol")
+    p.add_argument("--price_close_col", type=str, default="close")
+    p.add_argument(
+        "--price_ret_col",
+        type=str,
+        default="",
+        help="If provided, use this column as realized return instead of computing from close",
+    )
     return p.parse_args()
 
 
@@ -261,6 +363,15 @@ def main() -> None:
         k=args.k,
         cost_bp=args.cost_bp,
         calib=calib,
+        stride=int(args.stride),
+        recompute_y_from_prices=bool(args.recompute_y),
+        price_dir=Path(args.price_dir) if args.price_dir else None,
+        price_glob=args.price_glob,
+        price_ts_col=args.price_ts_col,
+        price_sym_col=args.price_sym_col,
+        price_close_col=args.price_close_col,
+        price_ret_col=args.price_ret_col,
+        overlap_scale=bool(args.overlap_scale),
     )
     print(summary)
 
