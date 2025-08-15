@@ -172,11 +172,14 @@ def run_backtest(
                 "No usable price files after parsing (check column names: symbol/date/ts_utc, close)."
             )
         prices = pd.concat(price_rows, axis=0, ignore_index=True)
-        # Join onto df (requires ts_utc present)
+        # Join onto df (requires timestamp); drop rows with missing ts
         if df["ts_utc"].isna().any():
-            raise RuntimeError(
-                "ts_utc missing in eval CSV; cannot join prices. Re-export with --require_samples_meta."
-            )
+            miss = int(df["ts_utc"].isna().sum())
+            df = df.dropna(subset=["ts_utc"]).copy()
+            if df.empty:
+                raise RuntimeError(
+                    "No valid timestamps in eval CSV after dropping missing ts_utc/ts_end."
+                )
         df = df.merge(prices, on=["symbol", "ts_utc"], how="left")
         # Overwrite y with price-based
         df[y_col] = df["y_price"]
