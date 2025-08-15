@@ -88,8 +88,11 @@ def run_backtest(
     out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(csv_path)
     # Parse timestamp; tolerate missing by creating an index if needed
+    # In eval CSVs we may have ts_utc or ts_end. Prefer ts_utc; fall back to ts_end.
     if "ts_utc" in df.columns:
         df["ts_utc"] = pd.to_datetime(df["ts_utc"], errors="coerce")
+    elif "ts_end" in df.columns:
+        df["ts_utc"] = pd.to_datetime(df["ts_end"], errors="coerce")
     else:
         df["ts_utc"] = pd.NaT
     # Required columns for selected horizon
