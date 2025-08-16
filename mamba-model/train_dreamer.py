@@ -216,6 +216,28 @@ def main() -> None:
         actor.train()
         critic.train()
         iters = 0
+        # accumulators
+        epoch_updates = 0
+        epoch_value_loss_sum = 0.0
+        epoch_actor_loss_sum = 0.0
+        epoch_step_count = 0
+        epoch_sum_abs_a = 0.0
+        disc_counts = [0, 0, 0]
+        cont_flat_count = 0
+        cont_sum_a = 0.0
+        cont_sum_a_sq = 0.0
+        entropy_sum = 0.0
+        entropy_steps = 0
+        sum_pnl = 0.0
+        sumsq_pnl = 0.0
+        sum_a_mu6 = 0.0
+        sum_cost = 0.0
+        sum_sigma_pen = 0.0
+        sum_reward = 0.0
+        adv_sum = 0.0
+        adv_sumsq = 0.0
+        adv_count = 0
+
         for xb in loaders["train"]:
             if len(xb) == 7:
                 x_cont, x_sym, x_hour, x_dow, x_base, x_quote, y = [
@@ -276,6 +298,15 @@ def main() -> None:
                         a_indices.append(a_idx)
                         a_signed = torch.tanh((a - 1.0))  # map {0,1,2} -> ~{-1,0,1}
                         entropies.append(dist.entropy())
+                        # action stats
+                        B_now = a_idx.size(0)
+                        epoch_step_count += int(B_now)
+                        epoch_sum_abs_a += float(a_signed.abs().sum().item())
+                        disc_counts[0] += int((a_idx == 0).sum().item())
+                        disc_counts[1] += int((a_idx == 1).sum().item())
+                        disc_counts[2] += int((a_idx == 2).sum().item())
+                        entropy_sum += float(dist.entropy().mean().item())
+                        entropy_steps += 1
                     else:
                         # Continuous sizing in [-1,1]
                         a_raw = logits_or_size
@@ -283,6 +314,17 @@ def main() -> None:
                         entropies.append(
                             (-(1 - a_signed.pow(2) + 1e-6).log()).mean(dim=-1)
                         )
+                        # action stats
+                        B_now = a_signed.size(0)
+                        epoch_step_count += int(B_now)
+                        epoch_sum_abs_a += float(a_signed.abs().sum().item())
+                        cont_flat_count += int((a_signed.abs() < 0.05).sum().item())
+                        cont_sum_a += float(a_signed.sum().item())
+                        cont_sum_a_sq += float((a_signed**2).sum().item())
+                        entropy_sum += float(
+                            (-(1 - a_signed.pow(2) + 1e-6).log()).mean().item()
+                        )
+                        entropy_steps += 1
 
                     # World model + reward under no_grad
                     with torch.no_grad():
@@ -300,6 +342,16 @@ def main() -> None:
                             - txn_cost
                             - args.risk_pen_sigma * sig6
                         )
+                        pnl = a_signed.squeeze(-1) * mu6 - txn_cost
+                        # accumulators
+                        sum_pnl += float(pnl.sum().item())
+                        sumsq_pnl += float((pnl**2).sum().item())
+                        sum_a_mu6 += float((a_signed.squeeze(-1) * mu6).sum().item())
+                        sum_cost += float(txn_cost.sum().item())
+                        sum_sigma_pen += float(
+                            (args.risk_pen_sigma * sig6).sum().item()
+                        )
+                        sum_reward += float(reward.sum().item())
                         rewards.append(reward)
 
                         # Prior step
@@ -334,6 +386,11 @@ def main() -> None:
                 V_tp1 = torch.stack(values_tp1, dim=0)  # [T,B]
                 targets = lambda_returns(R, V_tp1, gamma=args.gamma, lam=args.lam)
                 V_pred = torch.stack([critic(s) for s in states[0:-1]], dim=0)
+                # advantage stats
+                adv = targets - V_pred.detach()
+                adv_sum += float(adv.sum().item())
+                adv_sumsq += float((adv**2).sum().item())
+                adv_count += int(adv.numel())
 
                 # Losses
                 value_loss = F.mse_loss(V_pred, targets.detach())
@@ -380,14 +437,62 @@ def main() -> None:
             opt_actor.step()
 
             iters += 1
+            epoch_updates += 1
+            epoch_value_loss_sum += float(value_loss.detach().cpu())
+            epoch_actor_loss_sum += float(actor_loss.detach().cpu())
             if iters >= args.rl_updates_per_epoch:
                 break
 
+        # Epoch summary with finance metrics
+        mean_value_loss = epoch_value_loss_sum / max(epoch_updates, 1)
+        mean_actor_loss = epoch_actor_loss_sum / max(epoch_updates, 1)
+        entropy_epoch = entropy_sum / max(entropy_steps, 1)
+        mean_abs_a = epoch_sum_abs_a / max(epoch_step_count, 1)
+        if args.action_space == "discrete":
+            act_summary = {
+                "p_short": disc_counts[0] / max(epoch_step_count, 1),
+                "p_flat": disc_counts[1] / max(epoch_step_count, 1),
+                "p_long": disc_counts[2] / max(epoch_step_count, 1),
+            }
+        else:
+            cont_mean = cont_sum_a / max(epoch_step_count, 1)
+            cont_var = cont_sum_a_sq / max(epoch_step_count, 1) - cont_mean * cont_mean
+            cont_std = float(np.sqrt(max(cont_var, 1e-12)))
+            act_summary = {
+                "mean_a": cont_mean,
+                "std_a": cont_std,
+                "frac_flat(|a|<0.05)": cont_flat_count / max(epoch_step_count, 1),
+            }
+        mean_pnl = sum_pnl / max(epoch_step_count, 1)
+        var_pnl = sumsq_pnl / max(epoch_step_count, 1) - mean_pnl * mean_pnl
+        std_pnl = float(np.sqrt(max(var_pnl, 1e-12)))
+        sharpe = mean_pnl / (std_pnl + 1e-12)
+        finance = {
+            "avg_a_mu6": sum_a_mu6 / max(epoch_step_count, 1),
+            "avg_cost": sum_cost / max(epoch_step_count, 1),
+            "avg_sigma_pen": sum_sigma_pen / max(epoch_step_count, 1),
+            "avg_reward": sum_reward / max(epoch_step_count, 1),
+            "avg_pnl": mean_pnl,
+            "std_pnl": std_pnl,
+            "sharpe": sharpe,
+            "cum_pnl": sum_pnl,
+        }
+        adv_mean = adv_sum / max(adv_count, 1)
+        adv_var = adv_sumsq / max(adv_count, 1) - adv_mean * adv_mean
+        adv_std = float(np.sqrt(max(adv_var, 1e-12)))
         print(
             {
                 "epoch": epoch,
-                "value_loss": float(value_loss.detach().cpu()),
-                "actor_loss": float(actor_loss.detach().cpu()),
+                "value_loss": mean_value_loss,
+                "actor_loss": mean_actor_loss,
+                "entropy": entropy_epoch,
+                "mean_abs_action": mean_abs_a,
+                "actions": act_summary,
+                "finance": finance,
+                "adv_mean": adv_mean,
+                "adv_std": adv_std,
+                "updates": epoch_updates,
+                "imagined_steps": epoch_step_count,
             }
         )
 
