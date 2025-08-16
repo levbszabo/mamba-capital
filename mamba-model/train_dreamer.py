@@ -230,25 +230,29 @@ def main() -> None:
                 if autocast_dtype
                 else torch.cuda.amp.autocast(enabled=False)
             ):
-                # Posterior pass to get last latent and wm_state
-                E = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
-                B, L, _ = E.shape
-                h = torch.zeros(B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype)
-                z_t = None
-                if args.deterministic:
-                    for t in range(L):
-                        z_t = E[:, t, :]
-                        h = rssm.core(z_t, h, None)
-                    wm_state = h
-                else:
-                    for t in range(L):
-                        mu_p, logv_p = rssm.prior(h)
-                        mu_q, logv_q = rssm.posterior(h, E[:, t, :])
-                        z_t = mu_q
-                        h = rssm.core(z_t, h, None)
-                    wm_state = torch.cat([h, z_t], dim=-1)  # type: ignore
-                assert z_t is not None
-                mu, sigma = predict_mu_sigma(ret_head, z_t, args.likelihood)
+                # Posterior pass to get last latent and wm_state (no grads through WM)
+                with torch.no_grad():
+                    E = encoder(x_cont, x_sym, x_hour, x_dow, x_base, x_quote)
+                    B, L, _ = E.shape
+                    h = torch.zeros(
+                        B, rssm.cfg.hidden_dim, device=device, dtype=E.dtype
+                    )
+                    z_t = None
+                    if args.deterministic:
+                        for t in range(L):
+                            z_t = E[:, t, :]
+                            h = rssm.core(z_t, h, None)
+                        wm_state = h.detach()
+                    else:
+                        for t in range(L):
+                            mu_p, logv_p = rssm.prior(h)
+                            mu_q, logv_q = rssm.posterior(h, E[:, t, :])
+                            z_t = mu_q
+                            h = rssm.core(z_t, h, None)
+                        wm_state = torch.cat([h, z_t], dim=-1).detach()  # type: ignore
+                    assert z_t is not None
+                    z_t = z_t.detach()
+                    mu, sigma = predict_mu_sigma(ret_head, z_t, args.likelihood)
                 prev_action = torch.zeros(B, 1, device=device, dtype=E.dtype)
                 s_t = build_state(wm_state, mu, sigma, prev_action, select_idx)
 
@@ -263,7 +267,7 @@ def main() -> None:
                 h_curr = h
                 a_prev = prev_action
                 for k in range(T):
-                    # Actor step
+                    # Actor step (grad flows into actor)
                     logits_or_size = actor(states[-1])
                     if args.action_space == "discrete":
                         dist = torch.distributions.Categorical(logits=logits_or_size)
@@ -276,52 +280,54 @@ def main() -> None:
                         # Continuous sizing in [-1,1]
                         a_raw = logits_or_size
                         a_signed = torch.tanh(a_raw)
-                        # Approx entropy via log(1 - a^2)
                         entropies.append(
                             (-(1 - a_signed.pow(2) + 1e-6).log()).mean(dim=-1)
                         )
 
-                    # Reward from return head (use 6h index)
-                    mu_k, sigma_k = predict_mu_sigma(ret_head, z_curr, args.likelihood)
-                    mu6 = mu_k[:, select_idx[0]]
-                    sig6 = sigma_k[:, select_idx[0]]
-                    txn_cost = (args.txn_cost_bp * 1e-4) * (
-                        a_signed - a_prev
-                    ).abs().squeeze(-1)
-                    reward = (
-                        a_signed.squeeze(-1) * mu6
-                        - txn_cost
-                        - args.risk_pen_sigma * sig6
-                    )
-                    rewards.append(reward)
-
-                    # Critic bootstrap for next state
-                    # Prior step
-                    if rssm.cfg.stochastic:
-                        mu_p, logv_p = rssm.prior(h_curr)
-                        z_next = mu_p  # mean for stability
-                        h_next = rssm.core(z_next, h_curr, None)
-                    else:
-                        z_next, h_next = rssm.forward_deterministic(
-                            z_curr, h_curr, None
+                    # World model + reward under no_grad
+                    with torch.no_grad():
+                        # Reward from return head (use 6h index)
+                        mu_k, sigma_k = predict_mu_sigma(
+                            ret_head, z_curr, args.likelihood
                         )
+                        mu6 = mu_k[:, select_idx[0]]
+                        sig6 = sigma_k[:, select_idx[0]]
+                        txn_cost = (args.txn_cost_bp * 1e-4) * (
+                            a_signed - a_prev
+                        ).abs().squeeze(-1)
+                        reward = (
+                            a_signed.squeeze(-1) * mu6
+                            - txn_cost
+                            - args.risk_pen_sigma * sig6
+                        )
+                        rewards.append(reward)
 
-                    # Build next state features
-                    mu_next, sigma_next = predict_mu_sigma(
-                        ret_head, z_next, args.likelihood
-                    )
-                    wm_next = (
-                        h_next
-                        if args.deterministic
-                        else torch.cat([h_next, z_next], dim=-1)
-                    )
-                    s_next = build_state(
-                        wm_next, mu_next, sigma_next, a_signed, select_idx
-                    )
-                    states.append(s_next)
-                    z_curr, h_curr, a_prev = z_next, h_next, a_signed
-                    # Critic V(s_{t+1})
-                    values_tp1.append(critic(s_next).detach())
+                        # Prior step
+                        if rssm.cfg.stochastic:
+                            mu_p, logv_p = rssm.prior(h_curr)
+                            z_next = mu_p  # mean for stability
+                            h_next = rssm.core(z_next, h_curr, None)
+                        else:
+                            z_next, h_next = rssm.forward_deterministic(
+                                z_curr, h_curr, None
+                            )
+
+                        # Next state features
+                        mu_next, sigma_next = predict_mu_sigma(
+                            ret_head, z_next, args.likelihood
+                        )
+                        wm_next = (
+                            h_next
+                            if args.deterministic
+                            else torch.cat([h_next, z_next], dim=-1)
+                        )
+                        s_next = build_state(
+                            wm_next, mu_next, sigma_next, a_signed, select_idx
+                        )
+                        states.append(s_next)
+                        z_curr, h_curr, a_prev = z_next, h_next, a_signed
+                        # Critic V(s_{t+1}) (no grad)
+                        values_tp1.append(critic(s_next).detach())
 
                 # Stack tensors
                 R = torch.stack(rewards, dim=0)  # [T,B]
