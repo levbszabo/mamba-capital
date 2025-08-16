@@ -289,9 +289,7 @@ def train_one_epoch(
                 if likelihood == "gaussian":
                     sig_h = torch.exp(0.5 * logv_y[:, 0]).clamp_min(1e-8)
                 else:
-                    # Student-t: use scale s = softplus(log_s)
-                    _, log_s_temp, _ = ret_head(z_t)
-                    sig_h = F.softplus(log_s_temp[:, 0]).clamp_min(1e-8)
+                    sig_h = F.softplus(log_s_y[:, 0]).clamp_min(1e-8)
                 # Ensure float32 for stats (quantile doesn't support bf16)
                 mu_h_f = mu_h.float()
                 y_h_f = y_h.float()

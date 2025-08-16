@@ -72,6 +72,25 @@ def apply_free_nats(kl: torch.Tensor, free_nats: float) -> torch.Tensor:
     return torch.clamp(kl - float(free_nats), min=0.0).mean()
 
 
+def predict_mu_sigma(
+    ret_head: nn.Module, z_last: torch.Tensor, likelihood: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Helper to get mu and sigma from head for either Gaussian or Student-t.
+
+    Returns tensors with same device/dtype as head parameters.
+    """
+    if likelihood == "gaussian":
+        mu, logv = ret_head(z_last)
+        sigma = torch.exp(0.5 * logv)
+        return mu, sigma
+    else:
+        mu, log_s, nu = ret_head(z_last)
+        s = F.softplus(log_s)
+        denom = torch.clamp(nu - 2.0, min=1e-3)
+        sigma = s * torch.sqrt(nu / denom)
+        return mu, sigma
+
+
 @dataclass
 class WorldModelConfig:
     num_cont_features: int
@@ -199,7 +218,8 @@ class ObsDecoder(nn.Module):
         )
 
     def forward(self, z_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.mu(z_t), self.logvar(z_t)
+        z = z_t.to(next(self.mu.parameters()).dtype)
+        return self.mu(z), self.logvar(z)
 
 
 class ReturnHead(nn.Module):
@@ -224,7 +244,8 @@ class ReturnHead(nn.Module):
         )
 
     def forward(self, z_last: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.mu(z_last), self.logvar(z_last)
+        z = z_last.to(next(self.mu.parameters()).dtype)
+        return self.mu(z), self.logvar(z)
 
 
 class StudentTHead(nn.Module):
@@ -256,8 +277,10 @@ class StudentTHead(nn.Module):
     def forward(
         self, z_last: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu = self.mu(z_last)
-        log_s = self.log_s(z_last)
+        # Ensure dtype consistency for mixed precision
+        z = z_last.to(next(self.mu.parameters()).dtype)
+        mu = self.mu(z)
+        log_s = self.log_s(z)
         nu = F.softplus(self.nu_raw) + 2.0
         return mu, log_s, nu
 
