@@ -720,6 +720,7 @@ def main():
                 max_points=args.val_metrics_max_points,
                 use_zscore=args.val_use_zscore,
                 txn_cost_bp=args.val_txn_cost_bp,
+                likelihood=args.likelihood,
             )
         scheduler.step()
         log = {
