@@ -434,8 +434,12 @@ def evaluate(
                 kl_loss = kl_accum / max(L, 1)
 
             recon_loss = recon_loss / max(L, 1)
-            mu_y, logv_y = ret_head(z_t)
-            y_loss = gaussian_nll(y, mu_y, logv_y)
+            if likelihood == "gaussian":
+                mu_y, logv_y = ret_head(z_t)
+                y_loss = gaussian_nll(y, mu_y, logv_y)
+            else:
+                mu_y, log_s_y, nu_y = ret_head(z_t)
+                y_loss = student_t_nll(y, mu_y, log_s_y, nu_y)
             loss = (
                 recon_weight * recon_loss
                 + ((0.0 if deterministic else kl_beta * kl_loss))
@@ -469,6 +473,7 @@ def quick_val_metrics(
     max_points: int = 8000,
     use_zscore: bool = True,
     txn_cost_bp: float = 0.5,
+    likelihood: str = "gaussian",
 ) -> None:
     """Lightweight validation metrics for immediate feedback.
 
@@ -512,9 +517,16 @@ def quick_val_metrics(
                 z_t = mu_q
                 h = rssm.core(z_t, h, None)
         assert z_t is not None
-        mu_y, logv_y = ret_head(z_t)
+        if likelihood == "gaussian":
+            mu_y, logv_y = ret_head(z_t)
+            sig = torch.exp(0.5 * logv_y)
+        else:
+            mu_y, log_s_y, nu_y = ret_head(z_t)
+            s = F.softplus(log_s_y)
+            denom = torch.clamp(nu_y - 2.0, min=1e-3)
+            sig = s * torch.sqrt(nu_y / denom)
         MU_list.append(mu_y.detach().cpu())
-        SIG_list.append(torch.exp(0.5 * logv_y).detach().cpu())
+        SIG_list.append(sig.detach().cpu())
         Y_list.append(y.detach().cpu())
         N_total += y.size(0)
         if N_total >= max_points:
