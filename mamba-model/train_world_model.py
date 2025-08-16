@@ -20,6 +20,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from rssm import RSSM, RSSMConfig
@@ -28,7 +29,10 @@ from world_model import (
     ObsEncoder,
     ObsDecoder,
     ReturnHead,
+    StudentTHead,
+    SignHead,
     gaussian_nll,
+    student_t_nll,
     apply_free_nats,
 )
 
@@ -90,6 +94,19 @@ def parse_args():
     p.add_argument("--latent_dim", type=int, default=64)
     p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument(
+        "--likelihood",
+        type=str,
+        choices=["gaussian", "studentt"],
+        default="gaussian",
+        help="Observation model for return head",
+    )
+    p.add_argument(
+        "--sign_weight",
+        type=float,
+        default=0.0,
+        help="Weight for sign (direction) BCE loss per horizon",
+    )
     p.add_argument("--kl_beta", type=float, default=1.0)
     p.add_argument("--kl_beta_start", type=float, default=0.1)
     p.add_argument("--kl_warmup_epochs", type=int, default=5)
@@ -141,7 +158,8 @@ def train_one_epoch(
     encoder: ObsEncoder,
     rssm: RSSM,
     decoder: ObsDecoder,
-    head: ReturnHead,
+    ret_head,
+    sign_head: SignHead,
     loader: DataLoader,
     device: torch.device,
     autocast_dtype: Optional[torch.dtype],
@@ -152,11 +170,14 @@ def train_one_epoch(
     ret_weight: float,
     diag_every_steps: int,
     deterministic: bool,
+    likelihood: str,
+    sign_weight: float,
 ) -> float:
     encoder.train()
     rssm.train()
     decoder.train()
-    head.train()
+    ret_head.train()
+    sign_head.train()
     total = 0.0
     count = 0
     recon_total = 0.0
@@ -213,17 +234,24 @@ def train_one_epoch(
                 kl_loss = kl_accum / max(L, 1)
 
             recon_loss = recon_loss / max(L, 1)
-            # Return head on last latent h state: need last z_t; reuse mu_q of last step's sample
-            # For numerical stability, feed last latent derived from last posterior sample
-            mu_y, logv_y = head(z_t)
-            # Encourage meaningful means: clamp variance and add tiny penalty
-            logv_y = logv_y.clamp(min=-6.0, max=2.0)
-            y_loss = gaussian_nll(y, mu_y, logv_y) + 1e-6 * (logv_y**2).mean()
+            # Return head on last latent
+            if likelihood == "gaussian":
+                mu_y, logv_y = ret_head(z_t)
+                logv_y = logv_y.clamp(min=-6.0, max=2.0)
+                y_loss = gaussian_nll(y, mu_y, logv_y) + 1e-6 * (logv_y**2).mean()
+            else:
+                mu_y, log_s_y, nu_y = ret_head(z_t)
+                y_loss = student_t_nll(y, mu_y, log_s_y, nu_y)
+            # Sign loss per horizon
+            logits = sign_head(z_t)
+            sign_targets = (y > 0).float()
+            sign_loss = F.binary_cross_entropy_with_logits(logits, sign_targets)
 
             loss = (
                 recon_weight * recon_loss
                 + (0.0 if deterministic else kl_beta * kl_loss)
                 + ret_weight * y_loss
+                + sign_weight * sign_loss
             )
 
         optimizer.zero_grad(set_to_none=True)
@@ -232,7 +260,8 @@ def train_one_epoch(
             list(encoder.parameters())
             + list(rssm.parameters())
             + list(decoder.parameters())
-            + list(head.parameters()),
+            + list(ret_head.parameters())
+            + list(sign_head.parameters()),
             1.0,
         )
         optimizer.step()
@@ -257,7 +286,12 @@ def train_one_epoch(
             with torch.no_grad():
                 mu_h = mu_y[:, 0]
                 y_h = y[:, 0]
-                sig_h = torch.exp(0.5 * logv_y[:, 0]).clamp_min(1e-8)
+                if likelihood == "gaussian":
+                    sig_h = torch.exp(0.5 * logv_y[:, 0]).clamp_min(1e-8)
+                else:
+                    # Student-t: use scale s = softplus(log_s)
+                    _, log_s_temp, _ = ret_head(z_t)
+                    sig_h = F.softplus(log_s_temp[:, 0]).clamp_min(1e-8)
                 # Ensure float32 for stats (quantile doesn't support bf16)
                 mu_h_f = mu_h.float()
                 y_h_f = y_h.float()
@@ -332,7 +366,7 @@ def evaluate(
     encoder: ObsEncoder,
     rssm: RSSM,
     decoder: ObsDecoder,
-    head: ReturnHead,
+    ret_head: ReturnHead,
     loader: DataLoader,
     device: torch.device,
     autocast_dtype: Optional[torch.dtype],
@@ -341,11 +375,12 @@ def evaluate(
     ret_weight: float,
     recon_weight: float = 1.0,
     deterministic: bool = False,
+    likelihood: str = "gaussian",
 ) -> float:
     encoder.eval()
     rssm.eval()
     decoder.eval()
-    head.eval()
+    ret_head.eval()
     total = 0.0
     count = 0
     recon_total = 0.0
@@ -399,7 +434,7 @@ def evaluate(
                 kl_loss = kl_accum / max(L, 1)
 
             recon_loss = recon_loss / max(L, 1)
-            mu_y, logv_y = head(z_t)
+            mu_y, logv_y = ret_head(z_t)
             y_loss = gaussian_nll(y, mu_y, logv_y)
             loss = (
                 recon_weight * recon_loss
@@ -428,7 +463,7 @@ def evaluate(
 def quick_val_metrics(
     encoder: ObsEncoder,
     rssm: RSSM,
-    head: ReturnHead,
+    ret_head: ReturnHead,
     loader: DataLoader,
     device: torch.device,
     max_points: int = 8000,
@@ -477,7 +512,7 @@ def quick_val_metrics(
                 z_t = mu_q
                 h = rssm.core(z_t, h, None)
         assert z_t is not None
-        mu_y, logv_y = head(z_t)
+        mu_y, logv_y = ret_head(z_t)
         MU_list.append(mu_y.detach().cpu())
         SIG_list.append(torch.exp(0.5 * logv_y).detach().cpu())
         Y_list.append(y.detach().cpu())
@@ -586,13 +621,24 @@ def main():
         latent_dim=cfg.latent_dim, num_cont_features=cfg.num_cont_features
     ).to(device)
     num_horizons = int(len(meta["horizons"]))
-    head = ReturnHead(latent_dim=cfg.latent_dim, num_horizons=num_horizons).to(device)
+    if args.likelihood == "gaussian":
+        ret_head = ReturnHead(latent_dim=cfg.latent_dim, num_horizons=num_horizons).to(
+            device
+        )
+    else:
+        ret_head = StudentTHead(
+            latent_dim=cfg.latent_dim, num_horizons=num_horizons
+        ).to(device)
+    sign_head = SignHead(latent_dim=cfg.latent_dim, num_horizons=num_horizons).to(
+        device
+    )
 
     params = (
         list(encoder.parameters())
         + list(rssm.parameters())
         + list(decoder.parameters())
-        + list(head.parameters())
+        + list(ret_head.parameters())
+        + list(sign_head.parameters())
     )
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -620,7 +666,8 @@ def main():
             encoder,
             rssm,
             decoder,
-            head,
+            ret_head,
+            sign_head,
             loaders["train"],
             device,
             autocast_dtype,
@@ -631,12 +678,14 @@ def main():
             args.ret_weight,
             args.diag_every_steps,
             args.deterministic,
+            args.likelihood,
+            float(args.sign_weight),
         )
         val_loss = evaluate(
             encoder,
             rssm,
             decoder,
-            head,
+            ret_head,
             loaders["val"],
             device,
             autocast_dtype,
@@ -645,6 +694,7 @@ def main():
             args.ret_weight,
             args.recon_weight,
             args.deterministic,
+            args.likelihood,
         )
         if args.val_metrics_every_epochs and (
             epoch % args.val_metrics_every_epochs == 0
@@ -652,7 +702,7 @@ def main():
             quick_val_metrics(
                 encoder,
                 rssm,
-                head,
+                ret_head,
                 loaders["val"],
                 device,
                 max_points=args.val_metrics_max_points,
@@ -675,7 +725,7 @@ def main():
                     "encoder_state": encoder.state_dict(),
                     "rssm_state": rssm.state_dict(),
                     "decoder_state": decoder.state_dict(),
-                    "ret_head_state": head.state_dict(),
+                    "ret_head_state": ret_head.state_dict(),
                     "cfg": cfg.__dict__,
                     "val_loss": best_val,
                 },
@@ -689,12 +739,12 @@ def main():
         encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
         rssm.load_state_dict(ckpt["rssm_state"])  # type: ignore
         decoder.load_state_dict(ckpt["decoder_state"])  # type: ignore
-        head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
+        ret_head.load_state_dict(ckpt["ret_head_state"])  # type: ignore
     test_loss = evaluate(
         encoder,
         rssm,
         decoder,
-        head,
+        ret_head,
         loaders["test"],
         device,
         autocast_dtype,
@@ -703,6 +753,7 @@ def main():
         args.ret_weight,
         args.recon_weight,
         args.deterministic,
+        args.likelihood,
     )
     print(json.dumps({"test_loss": test_loss}))
 

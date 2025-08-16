@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from rssm import RSSM, RSSMConfig
 
@@ -37,6 +39,29 @@ def gaussian_nll(
         )
     )
     # Reduce over feature/time dims, mean over batch
+    while nll.dim() > 1:
+        nll = nll.mean(dim=-1)
+    return nll.mean()
+
+
+def student_t_nll(
+    x: torch.Tensor,
+    mu: torch.Tensor,
+    log_s: torch.Tensor,
+    nu: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Mean NLL per batch for independent Student-t per feature/horizon.
+
+    x, mu, log_s broadcast across last dim; nu should be broadcastable too.
+    Returns mean over all non-batch dims and mean over batch.
+    """
+    s = F.softplus(log_s) + eps
+    # Terms per element
+    t1 = torch.lgamma((nu + 1.0) / 2.0) - torch.lgamma(nu / 2.0)
+    t2 = 0.5 * (torch.log(nu) + math.log(math.pi)) + torch.log(s)
+    t3 = ((nu + 1.0) / 2.0) * torch.log1p(((x - mu) ** 2) / (nu * s * s + eps))
+    nll = t1 + t2 + t3
     while nll.dim() > 1:
         nll = nll.mean(dim=-1)
     return nll.mean()
@@ -200,6 +225,57 @@ class ReturnHead(nn.Module):
 
     def forward(self, z_last: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.mu(z_last), self.logvar(z_last)
+
+
+class StudentTHead(nn.Module):
+    """Predict Student-t parameters per horizon from latent.
+
+    Outputs:
+      mu: [B, H]
+      log_s: [B, H] (scale > 0 via softplus)
+      nu: [H] degrees of freedom (learned, shared across batch)
+    """
+
+    def __init__(self, latent_dim: int, num_horizons: int) -> None:
+        super().__init__()
+        self.mu = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, num_horizons),
+        )
+        self.log_s = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, num_horizons),
+        )
+        # One nu per horizon; constrained via softplus+2 in forward users
+        self.nu_raw = nn.Parameter(torch.zeros(num_horizons))
+
+    def forward(
+        self, z_last: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu = self.mu(z_last)
+        log_s = self.log_s(z_last)
+        nu = F.softplus(self.nu_raw) + 2.0
+        return mu, log_s, nu
+
+
+class SignHead(nn.Module):
+    """Predict logits for sign(y) per horizon from latent.
+
+    Logits > 0 => predict positive return.
+    """
+
+    def __init__(self, latent_dim: int, num_horizons: int) -> None:
+        super().__init__()
+        self.out = nn.Sequential(
+            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, num_horizons)
+        )
+
+    def forward(self, z_last: torch.Tensor) -> torch.Tensor:
+        return self.out(z_last)
 
 
 def roll_posterior_through_time(
