@@ -19,7 +19,13 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from rssm import RSSM, RSSMConfig
-from world_model import ObsEncoder, ObsDecoder, ReturnHead
+from world_model import (
+    ObsEncoder,
+    ObsDecoder,
+    ReturnHead,
+    StudentTHead,
+    predict_mu_sigma,
+)
 
 
 def load_tensors(dataset_dir: Path) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Dict]:
@@ -130,7 +136,13 @@ def main():
     decoder = ObsDecoder(
         latent_dim=latent_dim, num_cont_features=len(feature_names)
     ).to(device)
-    head = ReturnHead(latent_dim=latent_dim, num_horizons=num_horizons).to(device)
+    # Build return head matching checkpoint type (gaussian vs student-t)
+    ret_state = ckpt.get("ret_head_state", {})
+    is_student = any(k.startswith("log_s") or k == "nu_raw" for k in ret_state.keys())
+    if is_student:
+        head = StudentTHead(latent_dim=latent_dim, num_horizons=num_horizons).to(device)
+    else:
+        head = ReturnHead(latent_dim=latent_dim, num_horizons=num_horizons).to(device)
 
     encoder.load_state_dict(ckpt["encoder_state"])  # type: ignore
     # Allow partial load when switching between stochastic/deterministic RSSM
@@ -177,15 +189,17 @@ def main():
                 z_t = mu_q  # mean
                 h = rssm.core(z_t, h, None)
         assert z_t is not None
-        mu_y, logv_y = head(z_t)
+        mu_y, sig_y = predict_mu_sigma(
+            head, z_t, "studentt" if is_student else "gaussian"
+        )
         Y_list.append(yb)
         MU_list.append(mu_y.cpu())
-        SIG_list.append(torch.exp(0.5 * logv_y).cpu())
+        SIG_list.append(sig_y.cpu())
 
         # Optional per-row export (preserve original dataset info)
         if args.save_csv:
             mu_np = mu_y.detach().cpu().numpy()
-            sig_np = np.exp(0.5 * logv_y.detach().cpu().numpy())
+            sig_np = sig_y.detach().cpu().numpy()
             for b in range(B):
                 j = i0 + b
                 meta_j = samples[j] if j < len(samples) else {}
@@ -200,7 +214,6 @@ def main():
                     or meta_j.get("t_end")
                     or meta_j.get("timestamp")
                 )
-                # Include original dataset fields when available to maintain provenance
                 row = {
                     "idx": j,
                     "symbol": sym,

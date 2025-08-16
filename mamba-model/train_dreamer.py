@@ -115,6 +115,41 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--value_lr", type=float, default=3e-4)
     p.add_argument("--world_updates_per_epoch", type=int, default=0)
     p.add_argument("--rl_updates_per_epoch", type=int, default=200)
+    # Trading/finance shaping
+    p.add_argument(
+        "--reward_real_units",
+        action="store_true",
+        help="De-standardize mu/sigma with per-symbol scalers for rewards/PnL",
+    )
+    p.add_argument(
+        "--a_max",
+        type=float,
+        default=2.0,
+        help="Max absolute position for continuous/discrete base action",
+    )
+    p.add_argument(
+        "--leverage_from_z",
+        action="store_true",
+        help="Scale exposure by |z|/z_scale up to leverage_cap",
+    )
+    p.add_argument(
+        "--z_scale",
+        type=float,
+        default=1.0,
+        help="Z-score scale where leverage multiplier ~1",
+    )
+    p.add_argument(
+        "--leverage_cap",
+        type=float,
+        default=2.0,
+        help="Cap for z-based leverage multiplier",
+    )
+    p.add_argument(
+        "--risk_target_sigma_ref",
+        type=float,
+        default=0.0,
+        help="If >0, multiply exposure by sigma_ref/sigma to target risk",
+    )
     return p.parse_args()
 
 
@@ -188,6 +223,23 @@ def main() -> None:
     rssm.eval()
     decoder.eval()
     ret_head.eval()
+
+    # Prepare per-symbol target scalers for rewards in real units
+    target_scalers = meta.get("target_scalers")
+    symbol_to_id = vocab.get("symbol_to_id", {})
+    id_to_symbol = vocab.get("id_to_symbol") or {v: k for k, v in symbol_to_id.items()}
+    num_symbols = int(vocab["num_symbols"])
+    h_reward = horizons[select_idx[0]]
+    mean6_by_sym = torch.zeros(num_symbols, dtype=torch.float32)
+    std6_by_sym = torch.ones(num_symbols, dtype=torch.float32)
+    if target_scalers:
+        col = f"fwd_ret_log_{h_reward}h"
+        for sym, stats in target_scalers.items():
+            if sym in symbol_to_id and col in stats:
+                sid = int(symbol_to_id[sym])
+                m, s = stats[col]
+                mean6_by_sym[sid] = float(m)
+                std6_by_sym[sid] = float(s) if float(s) != 0.0 else 1.0
 
     # Build Actor/Critic
     wm_state_dim = (
@@ -334,22 +386,56 @@ def main() -> None:
                         )
                         mu6 = mu_k[:, select_idx[0]]
                         sig6 = sigma_k[:, select_idx[0]]
+                        # De-standardize if requested
+                        if args.reward_real_units and target_scalers:
+                            sym_ids = x_sym[:, 0].to(torch.long)
+                            m_b = mean6_by_sym.to(
+                                device=device, dtype=E.dtype
+                            ).index_select(0, sym_ids)
+                            s_b = std6_by_sym.to(
+                                device=device, dtype=E.dtype
+                            ).index_select(0, sym_ids)
+                            mu6_real = mu6 * s_b + m_b
+                            sig6_real = sig6 * s_b
+                        else:
+                            mu6_real = mu6
+                            sig6_real = sig6
+                        # Exposure scaling
+                        a_base = a_signed * args.a_max
+                        mult = 1.0
+                        if args.leverage_from_z:
+                            z_abs = (mu6 / (sig6 + 1e-6)).abs()
+                            mult = torch.clamp(
+                                z_abs / max(args.z_scale, 1e-6), 0.0, args.leverage_cap
+                            )
+                        if args.risk_target_sigma_ref > 0.0:
+                            mult = mult * torch.clamp(
+                                torch.as_tensor(
+                                    args.risk_target_sigma_ref,
+                                    device=device,
+                                    dtype=E.dtype,
+                                )
+                                / (sig6_real + 1e-9),
+                                0.0,
+                                args.leverage_cap,
+                            )
+                        a_eff = a_base * mult
                         txn_cost = (args.txn_cost_bp * 1e-4) * (
-                            a_signed - a_prev
+                            a_eff - a_prev
                         ).abs().squeeze(-1)
                         reward = (
-                            a_signed.squeeze(-1) * mu6
+                            a_eff.squeeze(-1) * mu6_real
                             - txn_cost
-                            - args.risk_pen_sigma * sig6
+                            - args.risk_pen_sigma * sig6_real
                         )
-                        pnl = a_signed.squeeze(-1) * mu6 - txn_cost
+                        pnl = a_eff.squeeze(-1) * mu6_real - txn_cost
                         # accumulators
                         sum_pnl += float(pnl.sum().item())
                         sumsq_pnl += float((pnl**2).sum().item())
-                        sum_a_mu6 += float((a_signed.squeeze(-1) * mu6).sum().item())
+                        sum_a_mu6 += float((a_eff.squeeze(-1) * mu6_real).sum().item())
                         sum_cost += float(txn_cost.sum().item())
                         sum_sigma_pen += float(
-                            (args.risk_pen_sigma * sig6).sum().item()
+                            (args.risk_pen_sigma * sig6_real).sum().item()
                         )
                         sum_reward += float(reward.sum().item())
                         rewards.append(reward)
@@ -374,10 +460,10 @@ def main() -> None:
                             else torch.cat([h_next, z_next], dim=-1)
                         )
                         s_next = build_state(
-                            wm_next, mu_next, sigma_next, a_signed, select_idx
+                            wm_next, mu_next, sigma_next, a_eff, select_idx
                         )
                         states.append(s_next)
-                        z_curr, h_curr, a_prev = z_next, h_next, a_signed
+                        z_curr, h_curr, a_prev = z_next, h_next, a_eff
                         # Critic V(s_{t+1}) (no grad)
                         values_tp1.append(critic(s_next).detach())
 
